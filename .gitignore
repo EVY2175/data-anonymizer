@@ -1,0 +1,39 @@
+﻿# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.idea/
+.vscode/
+
+# Сборка приложения
+build/
+dist/
+*.spec
+
+# Excel и другие потенциально конфиденциальные данные
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# Ключи и зашифрованные файлы
+*.key
+*.enc
+
+# Временные файлы Excel
+~$*
+
+# Логи
+*.log
+
+# ОС
+Thumbs.db
+.DS_Store
+
+# Переменные окружения
+.env
