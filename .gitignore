@@ -2,6 +2,7 @@
 .venv/
 venv/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 *.pyd
@@ -37,3 +38,4 @@ Thumbs.db
 
 # Переменные окружения
 .env
+.env.*
