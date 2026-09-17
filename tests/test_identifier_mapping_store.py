@@ -308,7 +308,15 @@ def test_no_parent_alias_concept_anywhere() -> None:
     field_names = {f.name for f in dataclasses.fields(IdentifierMappingEntry)}
     assert "parent_alias" not in field_names
 
-    for method_name in ("add", "get_by_token", "get_by_identity", "all_tokens", "entries", "clear"):
+    for method_name in (
+        "add",
+        "add_many",
+        "get_by_token",
+        "get_by_identity",
+        "all_tokens",
+        "entries",
+        "clear",
+    ):
         sig = inspect.signature(getattr(IdentifierMappingStore, method_name))
         assert "parent_alias" not in sig.parameters
         assert "parent" not in sig.parameters
@@ -331,20 +339,29 @@ def test_no_excel_coordinate_concept() -> None:
     for forbidden in ("sheet", "sheet_name", "row", "column", "cell", "coordinate"):
         assert forbidden not in field_names
 
-    for method_name in ("add", "get_by_token", "get_by_identity", "all_tokens", "entries", "clear"):
+    for method_name in (
+        "add",
+        "add_many",
+        "get_by_token",
+        "get_by_identity",
+        "all_tokens",
+        "entries",
+        "clear",
+    ):
         sig = inspect.signature(getattr(IdentifierMappingStore, method_name))
         for forbidden in ("sheet", "sheet_name", "row", "column", "cell", "coordinate"):
             assert forbidden not in sig.parameters
 
 
 # ---------------------------------------------------------------------------
-# W-X. Минимальный шестиметодный API, без лишнего
+# W-X. Минимальный семиметодный API, без лишнего (add_many — Stage 7B.4.3)
 # ---------------------------------------------------------------------------
 
 
-def test_abstract_api_has_exactly_six_methods() -> None:
+def test_abstract_api_has_exactly_seven_methods() -> None:
     assert IdentifierMappingStore.__abstractmethods__ == {
         "add",
+        "add_many",
         "get_by_token",
         "get_by_identity",
         "all_tokens",

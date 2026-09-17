@@ -123,6 +123,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional, Union
 
@@ -246,6 +247,28 @@ class EncryptedFileIdentifierMappingStore(IdentifierMappingStore):
         # Может поднять IdentifierMappingConflictError/TypeError — в этом
         # случае self._store и файл на диске остаются нетронутыми.
         candidate.add(entry)
+
+        self._persist_and_commit(candidate)
+
+    def add_many(self, entries: Iterable[IdentifierMappingEntry]) -> None:
+        batch = tuple(entries)
+        if not batch:
+            return
+
+        candidate = self._clone_store()
+        before = len(candidate.entries())
+
+        for entry in batch:
+            # Может поднять IdentifierMappingConflictError/TypeError — в
+            # этом случае ни self._store, ни файл на диске не тронуты:
+            # candidate целиком в памяти и отбрасывается.
+            candidate.add(entry)
+
+        after = len(candidate.entries())
+        if after == before:
+            # Весь batch — уже существующие точные дубликаты: ни
+            # candidate, ни файл переписывать не нужно.
+            return
 
         self._persist_and_commit(candidate)
 

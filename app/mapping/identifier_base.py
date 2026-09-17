@@ -68,6 +68,7 @@ MappingConflictError (Stage 2), который включает real_value в с
 from __future__ import annotations
 
 import abc
+from collections.abc import Iterable
 from typing import Optional
 
 from app.models.identifiers import IdentifierMappingEntry, IdentifierType
@@ -111,6 +112,43 @@ class IdentifierMappingStore(abc.ABC):
             связан с другой identity, либо identity записи
             (identifier_type, identifier_value) уже связана с другим token.
         :raises TypeError: если entry не является IdentifierMappingEntry.
+        """
+
+    @abc.abstractmethod
+    def add_many(self, entries: Iterable[IdentifierMappingEntry]) -> None:
+        """
+        Добавляет сразу несколько записей identifier mapping атомарно
+        (all-or-nothing) — Stage 7B.4.3.
+
+        entries материализуется ровно один раз (list/tuple/generator/
+        one-shot iterator принимаются одинаково); если сам entries
+        поднимает исключение во время материализации, хранилище остаётся
+        полностью неизменным (материализация происходит раньше любой
+        мутации состояния).
+
+        Пустой entries — no-op.
+
+        Точный дубликат (тот же token и та же identity, что уже есть в
+        хранилище либо ранее в этом же batch) — no-op для этой записи,
+        не конфликт.
+
+        Если хотя бы одна запись batch конфликтует (тот же token с другой
+        identity, либо та же identity с другим token — против уже
+        существующего состояния ИЛИ против другой записи этого же batch),
+        поднимается IdentifierMappingConflictError и НИ ОДНА запись batch
+        не применяется — хранилище остаётся в точности таким, каким было
+        до вызова.
+
+        Если весь batch применяется успешно, все его новые записи
+        становятся видны одновременно.
+
+        :raises IdentifierMappingConflictError: если любая запись batch
+            конфликтует с уже существующими данными или с другой записью
+            этого же batch. Сообщение не отличается от сообщения при
+            обычном add() — не включает позицию/индекс записи в batch и
+            никогда не включает сырое значение идентификатора.
+        :raises TypeError: если entries равен None либо содержит элемент,
+            не являющийся IdentifierMappingEntry.
         """
 
     @abc.abstractmethod

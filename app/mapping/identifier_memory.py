@@ -9,6 +9,7 @@ unit-тестов бизнес-логики и как основа контра�
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Optional
 
 from app.mapping.identifier_base import IdentifierMappingConflictError, IdentifierMappingStore
@@ -71,6 +72,28 @@ class InMemoryIdentifierMappingStore(IdentifierMappingStore):
 
         self._by_token[entry.token] = entry
         self._by_identity[identity] = entry
+
+    def add_many(self, entries: Iterable[IdentifierMappingEntry]) -> None:
+        batch = tuple(entries)
+        if not batch:
+            return
+
+        # Authoritative state — ровно _by_token/_by_identity (см. __init__),
+        # третьего индекса/derived mutable state нет, поэтому candidate
+        # можно строить прямым shallow-copy этих двух dict, без replay
+        # существующих записей через add(): это уже валидное состояние.
+        candidate = InMemoryIdentifierMappingStore()
+        candidate._by_token = self._by_token.copy()
+        candidate._by_identity = self._by_identity.copy()
+
+        for entry in batch:
+            # Может поднять IdentifierMappingConflictError/TypeError — в
+            # этом случае self не тронут, candidate отбрасывается целиком.
+            candidate.add(entry)
+
+        # Commit только после полного успеха всего batch.
+        self._by_token = candidate._by_token
+        self._by_identity = candidate._by_identity
 
     def clear(self) -> None:
         self._by_token.clear()
