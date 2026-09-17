@@ -15,6 +15,7 @@ from app.security.alias_generator import (
     PRODUCTION_ALPHABET,
     PRODUCTION_RANDOM_LENGTH,
     AliasSpaceExhaustedError,
+    _MAX_ATTEMPTS,
     generate_alias,
 )
 
@@ -178,6 +179,34 @@ def test_exhaustion_after_filling_entire_small_keyspace() -> None:
             alphabet=alphabet,
             random_length=random_length,
         )
+
+
+def test_exhaustion_error_message_matches_historical_wording() -> None:
+    """
+    Regression (Stage 7B.2 corrective pass): извлечение общего core для
+    generate_alias/generate_identifier_token не должно было изменить
+    исторический текст AliasSpaceExhaustedError. Фиксируем его дословно.
+    """
+    alphabet = "A"
+    random_length = 1
+    existing = {"C_A"}  # единственное возможное значение уже занято
+
+    with pytest.raises(AliasSpaceExhaustedError) as exc_info:
+        generate_alias(
+            EntityType.COMPANY,
+            existing_aliases=existing,
+            alphabet=alphabet,
+            random_length=random_length,
+        )
+
+    expected_message = (
+        "Не удалось сгенерировать уникальный alias за "
+        f"{_MAX_ATTEMPTS} попыток (keyspace=1, "
+        "уже занято алиасов: 1). "
+        "Пространство псевдонимов исчерпано или практически исчерпано "
+        "относительно количества уже выданных значений."
+    )
+    assert str(exc_info.value) == expected_message
 
 
 # ---------------------------------------------------------------------------
