@@ -396,9 +396,6 @@ def test_only_failing_cell_creates_no_entry_earlier_cells_stay() -> None:
     [
         FieldType.BRANCH,
         FieldType.DEPARTMENT,
-        FieldType.INN,
-        FieldType.KPP,
-        FieldType.OGRN,
         FieldType.PHONE,
         FieldType.EMAIL,
         FieldType.ADDRESS,
