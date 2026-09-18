@@ -151,12 +151,36 @@ keyword-only параметр identifier_store. Ключевые отличия 
       identity/token — Python-тип исходного значения не восстановим из
       IdentifierMappingStore (frozen contract, Stage 7B.0-correction);
       leading zero, потерянный Excel при чтении int, здесь НЕ
-      восстанавливается и не угадывается — это граница будущего,
-      отдельно проектируемого provenance-слоя перед Stage 8 (Writer),
-      не решаемая ни этим модулем, ни Stage 7B.5;
+      восстанавливается и не угадывается identifier-слоем — какое именно
+      Python-представление было у исходной ячейки, опционально фиксирует
+      отдельный provenance-слой (см. раздел ниже), не подменяя эту
+      identity-границу;
     - если ни одно правило не требует identifier tokenization,
       identifier_store вообще не читается (даже если передан) — ни
       all_tokens(), ни add_many(), ни любой другой метод.
+
+======================================================================
+Provenance identifier-ячеек (Stage 7C.4) — опциональный, отдельный слой
+======================================================================
+
+Keyword-only параметр provenance_store: Optional[ProvenanceStore] = None
+позволяет опционально фиксировать, в каком именно Python-представлении
+(str/int, см. IdentifierRepresentation) была КОНКРЕТНАЯ ячейка ДО
+tokenization — по одной IdentifierCellProvenance на каждую УСПЕШНО
+токенизированную identifier-ячейку (coordinate = table.sheet_name +
+CellRecord.row/column), независимо от того, был ли token переиспользован
+(persisted/pending) или сгенерирован заново. Provenance — per-cell, а не
+per-new-mapping: одна и та же identity в двух ячейках даёт ОДИН token, но
+ДВЕ provenance-записи.
+
+Если provenance_store не передан (None), никакая provenance-работа не
+выполняется вообще (ни один IdentifierCellProvenance не создаётся).
+provenance_store НИКОГДА не заменяет требование identifier_store для
+identifier PSEUDONYMIZE — см. MissingIdentifierStoreError ниже.
+
+Эта функция не читает, не генерирует и не сравнивает
+provenance_store.job_id — job_id целиком принадлежит store/sidecar,
+созданному ДО вызова этой функции (см. app.mapping.provenance_base).
 
 ======================================================================
 Атомарность (или, точнее, её отсутствие) — РАЗНАЯ для entity и identifier
@@ -182,6 +206,17 @@ IdentifierMappingStore — внешние mutable-зависимости с РА
 Любая ошибка MappingStore/IdentifierMappingStore (MappingConflictError,
 IdentifierMappingConflictError и т.п.) всегда распространяется наружу
 как есть, а не подавляется.
+
+provenance_store (Stage 7C.4) следует ТОЙ ЖЕ схеме, что и identifier_store,
+но КОММИТИТСЯ ПОСЛЕ него: новые IdentifierCellProvenance накапливаются
+только в памяти и передаются в provenance_store.add_many(...) один раз,
+сразу после identifier_store.add_many(...) и до return. Если
+identifier-коммит падает — provenance_store.add_many не вызывается вообще.
+Если identifier-коммит уже успешен, а падает provenance-коммит — исключение
+распространяется, результирующая таблица не возвращается, но
+identifier_store к этому моменту уже может содержать новые записи. Эта
+асимметрия сознательно принята (см. Stage 7C.4 design review) — без
+rollback, 2PC или кросс-файловой транзакции.
 """
 
 from __future__ import annotations
@@ -193,8 +228,10 @@ from app.detectors import is_valid_inn, is_valid_kpp, is_valid_ogrn, is_valid_og
 from app.excel.models import CellRecord, FlatTable
 from app.mapping.base import MappingStore
 from app.mapping.identifier_base import IdentifierMappingStore
+from app.mapping.provenance_base import ProvenanceStore
 from app.models.entities import EntityType, MappingEntry
 from app.models.identifiers import IdentifierMappingEntry, IdentifierType
+from app.models.provenance import IdentifierCellProvenance, IdentifierRepresentation
 from app.models.rules import Action, FieldRule, FieldType
 from app.security.alias_generator import generate_alias, generate_identifier_token
 
@@ -318,11 +355,12 @@ def anonymize_flat_table(
     mapping_store: MappingStore,
     *,
     identifier_store: Optional[IdentifierMappingStore] = None,
+    provenance_store: Optional[ProvenanceStore] = None,
 ) -> FlatTable:
     """
     Применяет rules (индекс колонки -> FieldRule) к table через
-    mapping_store (и, при необходимости, identifier_store) и возвращает
-    НОВЫЙ FlatTable.
+    mapping_store (и, при необходимости, identifier_store/
+    provenance_store) и возвращает НОВЫЙ FlatTable.
 
     :param table: исходная таблица; не изменяется (физически не может
         быть изменена — CellRecord/FlatTable неизменяемы).
@@ -337,6 +375,14 @@ def anonymize_flat_table(
         FieldType.INN/KPP/OGRN (Stage 7B.5). Если таких правил нет,
         identifier_store допустимо не передавать (None) и он вообще не
         читается — ни all_tokens(), ни add_many(), ни любой другой метод.
+    :param provenance_store: уже открытый ProvenanceStore (Stage 7C.4) —
+        опционален независимо от identifier_store. Если передан, для
+        каждой успешно токенизированной identifier-ячейки создаётся одна
+        IdentifierCellProvenance (coordinate = table.sheet_name +
+        CellRecord.row/column, representation — по исходному
+        Python-типу значения ячейки). Если не передан (None), никакая
+        provenance-работа не выполняется. Никогда не заменяет требование
+        identifier_store — см. MissingIdentifierStoreError.
 
     ======================================================================
     Транзакционность: ДВЕ разные гарантии для двух store (Stage 7B.5)
@@ -366,6 +412,15 @@ def anonymize_flat_table(
     меняются), а identifier_store уже спроектирован для all-or-nothing
     batch-вставки (Stage 7B.4.3) — грех было бы не использовать её здесь.
 
+    provenance_store (Stage 7C.4), если передан, коммитится ТЕМ ЖЕ
+    all-or-nothing batch-способом, но СТРОГО ПОСЛЕ identifier_store: если
+    identifier_store.add_many(...) падает — provenance_store.add_many(...)
+    не вызывается вообще; если identifier-коммит уже прошёл успешно, а
+    провалился provenance-коммит — identifier_store к этому моменту уже
+    может содержать новые записи, а результирующая таблица не
+    возвращается. Это принятая асимметрия (см. Stage 7C.4 design review),
+    без rollback/2PC/кросс-файловой транзакции.
+
     :raises InvalidRuleConfigurationError: некорректное покрытие/ключи rules.
     :raises MissingIdentifierStoreError: rules требует identifier
         tokenization, но identifier_store не передан. Поднимается до
@@ -380,6 +435,8 @@ def anonymize_flat_table(
     :raises MappingConflictError: как есть, из mapping_store.add(...).
     :raises IdentifierMappingConflictError: как есть, из
         identifier_store.add_many(...).
+    :raises ProvenanceConflictError: как есть, из
+        provenance_store.add_many(...).
     """
     _validate_rules(table, rules)
     _validate_pseudonymization_targets(rules)
@@ -402,6 +459,13 @@ def anonymize_flat_table(
     pending_by_identity: dict[tuple[IdentifierType, str], str] = {}
     pending_entries: list[IdentifierMappingEntry] = []
 
+    # Provenance-работа выполняется только если provenance_store реально
+    # передан — None здесь означает "не собирать provenance вообще", а не
+    # "собрать и не сохранить" (см. docstring модуля, Stage 7C.4).
+    pending_provenance_entries: Optional[list[IdentifierCellProvenance]] = (
+        [] if provenance_store is not None else None
+    )
+
     new_rows = tuple(
         _anonymize_row(
             row,
@@ -412,6 +476,8 @@ def anonymize_flat_table(
             used_tokens,
             pending_by_identity,
             pending_entries,
+            table.sheet_name,
+            pending_provenance_entries,
         )
         for row in table.rows
     )
@@ -424,6 +490,12 @@ def anonymize_flat_table(
     # (см. EncryptedFileIdentifierMappingStore.add_many, Stage 7B.4.3).
     if pending_entries:
         identifier_store.add_many(pending_entries)  # type: ignore[union-attr]
+
+    # Provenance-коммит СТРОГО ПОСЛЕ identifier-коммита (frozen order,
+    # Stage 7C.4 design review) — если предыдущий шаг падает, до этой
+    # строки исполнение не доходит.
+    if pending_provenance_entries:
+        provenance_store.add_many(pending_provenance_entries)  # type: ignore[union-attr]
 
     return candidate
 
@@ -496,6 +568,8 @@ def _anonymize_row(
     used_tokens: set[str],
     pending_by_identity: dict[tuple[IdentifierType, str], str],
     pending_entries: list[IdentifierMappingEntry],
+    sheet_name: str,
+    pending_provenance_entries: Optional[list[IdentifierCellProvenance]],
 ) -> tuple[CellRecord, ...]:
     return tuple(
         _anonymize_cell(
@@ -507,6 +581,8 @@ def _anonymize_row(
             used_tokens,
             pending_by_identity,
             pending_entries,
+            sheet_name,
+            pending_provenance_entries,
         )
         for cell in row
     )
@@ -521,6 +597,8 @@ def _anonymize_cell(
     used_tokens: set[str],
     pending_by_identity: dict[tuple[IdentifierType, str], str],
     pending_entries: list[IdentifierMappingEntry],
+    sheet_name: str,
+    pending_provenance_entries: Optional[list[IdentifierCellProvenance]],
 ) -> CellRecord:
     if rule.action is Action.KEEP:
         return cell
@@ -539,6 +617,8 @@ def _anonymize_cell(
             pending_by_identity,
             pending_entries,
             identifier_store,  # type: ignore[arg-type]
+            sheet_name,
+            pending_provenance_entries,
         )
 
     return _pseudonymize_entity_cell(cell, rule.field_type, mapping_store, existing_aliases)
@@ -597,6 +677,8 @@ def _pseudonymize_identifier_cell(
     pending_by_identity: dict[tuple[IdentifierType, str], str],
     pending_entries: list[IdentifierMappingEntry],
     identifier_store: IdentifierMappingStore,
+    sheet_name: str,
+    pending_provenance_entries: Optional[list[IdentifierCellProvenance]],
 ) -> CellRecord:
     """
     Stage 7B.5: identifier tokenization для одной ячейки FieldType.INN/
@@ -606,6 +688,14 @@ def _pseudonymize_identifier_cell(
     (если понадобилась) только добавляется в pending_entries; фактический
     identifier_store.add_many(pending_entries) происходит один раз, после
     полной успешной обработки всей таблицы (см. anonymize_flat_table).
+
+    Stage 7C.4: если pending_provenance_entries не None (т.е. вызывающая
+    сторона передала provenance_store), для ЛЮБОЙ успешно токенизированной
+    ячейки — независимо от того, был token переиспользован (persisted/
+    pending) или сгенерирован заново — в pending_provenance_entries
+    добавляется одна IdentifierCellProvenance с EXACT координатой этой
+    ячейки и EXACT токеном, который реально попадёт в возвращаемый
+    CellRecord. provenance_store сам НЕ мутируется здесь.
     """
     value = cell.value
 
@@ -638,6 +728,13 @@ def _pseudonymize_identifier_cell(
     # граница ответственности, не решается здесь, см. docstring модуля).
     identifier_value = value if isinstance(value, str) else str(value)
 
+    # Representation (Stage 7C.4) — по ИСХОДНОМУ Python-типу value, той же
+    # проверкой isinstance(value, str), что уже используется выше для
+    # identifier_value: не по identifier_value/token/validator.
+    representation = (
+        IdentifierRepresentation.STRING if isinstance(value, str) else IdentifierRepresentation.INTEGER
+    )
+
     identity = (identifier_type, identifier_value)
 
     existing_entry = identifier_store.get_by_identity(identifier_type, identifier_value)
@@ -652,6 +749,20 @@ def _pseudonymize_identifier_cell(
         pending_entries.append(
             IdentifierMappingEntry(
                 token=token, identifier_value=identifier_value, identifier_type=identifier_type
+            )
+        )
+
+    # Provenance — per-cell, а не per-new-mapping: добавляется во ВСЕХ
+    # трёх ветках выше (persisted/pending/generated), только если
+    # provenance_store вообще был передан вызывающей стороной.
+    if pending_provenance_entries is not None:
+        pending_provenance_entries.append(
+            IdentifierCellProvenance(
+                sheet_name=sheet_name,
+                row=cell.row,
+                column=cell.column,
+                token=token,
+                representation=representation,
             )
         )
 

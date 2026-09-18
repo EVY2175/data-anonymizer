@@ -41,7 +41,10 @@ from app.mapping.encrypted_identifier_file import EncryptedFileIdentifierMapping
 from app.mapping.identifier_base import IdentifierMappingConflictError
 from app.mapping.identifier_memory import InMemoryIdentifierMappingStore
 from app.mapping.memory import InMemoryMappingStore
+from app.mapping.provenance_base import ProvenanceConflictError
+from app.mapping.provenance_memory import InMemoryProvenanceStore
 from app.models.identifiers import IdentifierMappingEntry, IdentifierType
+from app.models.provenance import IdentifierRepresentation
 from app.models.rules import Action, FieldRule, FieldType
 from app.security.alias_generator import PRODUCTION_RANDOM_LENGTH
 
@@ -900,3 +903,651 @@ def test_existing_stage_7a_company_behavior_remains_intact() -> None:
     result = anonymize_flat_table(table, rules, InMemoryMappingStore())
     assert result.rows[0][0].value == result.rows[1][0].value
     assert result.rows[0][0].value != result.rows[2][0].value
+
+
+# ===========================================================================
+# Stage 7C.4 — provenance integration
+# ===========================================================================
+
+JOB_ID = "job-stage-7c4-test"
+
+
+class _RecordingIdentifierStore(InMemoryIdentifierMappingStore):
+    """Тестовый double: фиксирует порядок вызова add_many поверх реального store."""
+
+    def __init__(self, order: list[str]) -> None:
+        super().__init__()
+        self._order = order
+
+    def add_many(self, entries):
+        self._order.append("identifier")
+        super().add_many(entries)
+
+
+class _RecordingProvenanceStore(InMemoryProvenanceStore):
+    """Тестовый double: фиксирует порядок вызова add_many поверх реального store."""
+
+    def __init__(self, job_id: str, order: list[str]) -> None:
+        super().__init__(job_id=job_id)
+        self._order = order
+
+    def add_many(self, entries):
+        self._order.append("provenance")
+        super().add_many(entries)
+
+
+class _FailingIdentifierStore(InMemoryIdentifierMappingStore):
+    """Тестовый double: identifier-коммит всегда падает."""
+
+    def add_many(self, entries):
+        raise IdentifierMappingConflictError("simulated identifier commit failure")
+
+
+class _FailingProvenanceStore(InMemoryProvenanceStore):
+    """Тестовый double: provenance-коммит всегда падает."""
+
+    def add_many(self, entries):
+        raise ProvenanceConflictError("simulated provenance commit failure")
+
+
+class _CountingProvenanceStore(InMemoryProvenanceStore):
+    """Тестовый double: считает вызовы add_many поверх реального store."""
+
+    def __init__(self, job_id: str, counter: dict[str, int]) -> None:
+        super().__init__(job_id=job_id)
+        self._counter = counter
+
+    def add_many(self, entries):
+        self._counter["n"] += 1
+        super().add_many(entries)
+
+
+# ---------------------------------------------------------------------------
+# A. Backward compatibility — omitting provenance_store
+# ---------------------------------------------------------------------------
+
+
+def test_omitting_provenance_store_does_not_alter_identifier_tokenization() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    result = anonymize_flat_table(table, rules, InMemoryMappingStore(), identifier_store=identifier_store)
+    assert result.rows[0][0].value.startswith("INN_")
+    assert len(identifier_store.entries()) == 1
+
+
+def test_provenance_store_is_keyword_only_and_defaults_to_none() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    result = anonymize_flat_table(
+        table, rules, InMemoryMappingStore(), identifier_store=identifier_store, provenance_store=None
+    )
+    assert result.rows[0][0].value.startswith("INN_")
+
+
+# ---------------------------------------------------------------------------
+# B. Happy path — exact provenance for INN/KPP/OGRN, str and int
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_created_for_inn_str() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("Лист1", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    result = anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    token = result.rows[0][0].value
+    entries = provenance_store.entries()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.sheet_name == "Лист1"
+    assert entry.row == 2
+    assert entry.column == 1
+    assert entry.token == token
+    assert entry.representation is IdentifierRepresentation.STRING
+
+
+def test_provenance_created_for_inn_int() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("Лист1", ["ИНН"], [[int(VALID_INN)]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    result = anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    token = result.rows[0][0].value
+    entries = provenance_store.entries()
+    assert len(entries) == 1
+    assert entries[0].token == token
+    assert entries[0].representation is IdentifierRepresentation.INTEGER
+
+
+def test_provenance_created_for_kpp_str() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("Лист1", ["КПП"], [[VALID_KPP]])
+    rules = {1: _identifier_rule("КПП", FieldType.KPP)}
+    result = anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    token = result.rows[0][0].value
+    entries = provenance_store.entries()
+    assert len(entries) == 1
+    assert entries[0].sheet_name == "Лист1"
+    assert entries[0].row == 2
+    assert entries[0].column == 1
+    assert entries[0].token == token
+    assert entries[0].representation is IdentifierRepresentation.STRING
+
+
+def test_provenance_created_for_ogrn_str() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("Лист1", ["ОГРН"], [[VALID_OGRN]])
+    rules = {1: _identifier_rule("ОГРН", FieldType.OGRN)}
+    result = anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    token = result.rows[0][0].value
+    entries = provenance_store.entries()
+    assert len(entries) == 1
+    assert entries[0].token == token
+    assert entries[0].representation is IdentifierRepresentation.STRING
+
+
+def test_provenance_created_for_ogrn_int() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("Лист1", ["ОГРН"], [[int(VALID_OGRN)]])
+    rules = {1: _identifier_rule("ОГРН", FieldType.OGRN)}
+    result = anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    token = result.rows[0][0].value
+    entries = provenance_store.entries()
+    assert len(entries) == 1
+    assert entries[0].token == token
+    assert entries[0].representation is IdentifierRepresentation.INTEGER
+
+
+# ---------------------------------------------------------------------------
+# C. No provenance for non-identifier paths
+# ---------------------------------------------------------------------------
+
+
+def test_no_provenance_for_entity_cell() -> None:
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["Компания"], [["ООО Ромашка"]])
+    rules = {1: _rule("Компания", FieldType.COMPANY, Action.PSEUDONYMIZE)}
+    anonymize_flat_table(table, rules, InMemoryMappingStore(), provenance_store=provenance_store)
+    assert provenance_store.entries() == ()
+
+
+def test_no_provenance_for_remove() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN, Action.REMOVE)}
+    anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    assert provenance_store.entries() == ()
+
+
+def test_no_provenance_for_keep() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN, Action.KEEP)}
+    anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    assert provenance_store.entries() == ()
+
+
+def test_no_provenance_for_empty_and_whitespace() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[None], [""], ["   "]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    assert provenance_store.entries() == ()
+
+
+def test_no_provenance_commit_on_formula_error() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [["=SUM(A1:A2)"]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    with pytest.raises(FormulaPseudonymizationError):
+        anonymize_flat_table(
+            table,
+            rules,
+            InMemoryMappingStore(),
+            identifier_store=identifier_store,
+            provenance_store=provenance_store,
+        )
+    assert provenance_store.entries() == ()
+
+
+def test_no_provenance_commit_on_invalid_identifier_value() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [["not-a-valid-inn"]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    with pytest.raises(InvalidIdentifierValueError):
+        anonymize_flat_table(
+            table,
+            rules,
+            InMemoryMappingStore(),
+            identifier_store=identifier_store,
+            provenance_store=provenance_store,
+        )
+    assert provenance_store.entries() == ()
+
+
+# ---------------------------------------------------------------------------
+# D. Duplicate identifier cells (distinct coordinates)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_identifier_across_cells_shares_token_but_gets_two_provenance_entries() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN], [VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    result = anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    token_a = result.rows[0][0].value
+    token_b = result.rows[1][0].value
+    assert token_a == token_b
+
+    entries = provenance_store.entries()
+    assert len(entries) == 2
+    coordinates = {(e.row, e.column) for e in entries}
+    assert coordinates == {(2, 1), (3, 1)}
+    assert all(e.token == token_a for e in entries)
+
+
+# ---------------------------------------------------------------------------
+# E. Same identity, different representation
+# ---------------------------------------------------------------------------
+
+
+def test_same_identity_str_and_int_share_token_but_differ_in_provenance_representation() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN], [int(VALID_INN)]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    result = anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    token_str = result.rows[0][0].value
+    token_int = result.rows[1][0].value
+    assert token_str == token_int
+
+    entries = {(e.row, e.column): e for e in provenance_store.entries()}
+    assert len(entries) == 2
+    assert entries[(2, 1)].representation is IdentifierRepresentation.STRING
+    assert entries[(3, 1)].representation is IdentifierRepresentation.INTEGER
+    assert entries[(2, 1)].token == token_str
+    assert entries[(3, 1)].token == token_str
+
+
+# ---------------------------------------------------------------------------
+# F. Existing (persisted) identifier mapping still produces provenance
+# ---------------------------------------------------------------------------
+
+
+def test_existing_persisted_mapping_still_produces_provenance() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    identifier_store.add(
+        IdentifierMappingEntry(
+            token="INN_PRESEEDED1", identifier_value=VALID_INN, identifier_type=IdentifierType.INN
+        )
+    )
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    result = anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    assert result.rows[0][0].value == "INN_PRESEEDED1"
+    entries = provenance_store.entries()
+    assert len(entries) == 1
+    assert entries[0].token == "INN_PRESEEDED1"
+    assert entries[0].row == 2
+    assert entries[0].column == 1
+
+
+# ---------------------------------------------------------------------------
+# G. Pending (same-table, not-yet-persisted) mapping reuse
+# ---------------------------------------------------------------------------
+
+
+def test_pending_mapping_reuse_produces_provenance_for_both_cells() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN], [VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    assert len(identifier_store.entries()) == 1  # один pending token, не два
+    assert len(provenance_store.entries()) == 2  # но два provenance entry
+
+
+# ---------------------------------------------------------------------------
+# H. Commit ordering
+# ---------------------------------------------------------------------------
+
+
+def test_commit_order_is_identifier_then_provenance() -> None:
+    order: list[str] = []
+    identifier_store = _RecordingIdentifierStore(order)
+    provenance_store = _RecordingProvenanceStore(JOB_ID, order)
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    assert order == ["identifier", "provenance"]
+
+
+# ---------------------------------------------------------------------------
+# I. Identifier commit failure
+# ---------------------------------------------------------------------------
+
+
+def test_identifier_commit_failure_prevents_provenance_commit() -> None:
+    identifier_store = _FailingIdentifierStore()
+    provenance_counter = {"n": 0}
+    provenance_store = _CountingProvenanceStore(JOB_ID, provenance_counter)
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+
+    with pytest.raises(IdentifierMappingConflictError):
+        anonymize_flat_table(
+            table,
+            rules,
+            InMemoryMappingStore(),
+            identifier_store=identifier_store,
+            provenance_store=provenance_store,
+        )
+
+    assert provenance_counter["n"] == 0
+    assert provenance_store.entries() == ()
+
+
+# ---------------------------------------------------------------------------
+# J. Provenance commit failure
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_commit_failure_leaves_identifier_mapping_already_committed() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = _FailingProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+
+    with pytest.raises(ProvenanceConflictError):
+        anonymize_flat_table(
+            table,
+            rules,
+            InMemoryMappingStore(),
+            identifier_store=identifier_store,
+            provenance_store=provenance_store,
+        )
+
+    # Принятая асимметрия (Stage 7C.4 design review): identifier_store уже
+    # содержит новую запись, хотя результирующая таблица не была возвращена.
+    assert len(identifier_store.entries()) == 1
+    assert identifier_store.entries()[0].identifier_value == VALID_INN
+
+
+# ---------------------------------------------------------------------------
+# K. Provenance conflict — repeated coordinate input (anonymizer does not
+# deduplicate; frozen ProvenanceStore semantics decide)
+# ---------------------------------------------------------------------------
+
+
+def _table_with_repeated_coordinate(value_a: object, value_b: object) -> FlatTable:
+    """
+    Синтетическая FlatTable с ДВУМЯ разными "строками" данных, чьи
+    CellRecord намеренно указывают на ОДНУ И ТУ ЖЕ координату (row=2,
+    column=1) — FlatTable/CellRecord это не запрещают (см. Stage 7C.4
+    design review, раздел про repeated-coordinate input). Используется,
+    чтобы доказать, что anonymizer НЕ дедуплицирует pending provenance по
+    координате самостоятельно, а передаёт весь batch как есть в
+    ProvenanceStore.add_many(), оставляя решение конфликтов store.
+    """
+    header = (CellRecord(row=1, column=1, value="ИНН"),)
+    row_a = (CellRecord(row=2, column=1, value=value_a),)
+    row_b = (CellRecord(row=2, column=1, value=value_b),)
+    return FlatTable(sheet_name="S", header_row=header, rows=(row_a, row_b))
+
+
+def test_repeated_coordinate_exact_duplicate_is_idempotent() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table_with_repeated_coordinate(VALID_INN, VALID_INN)
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+
+    anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+
+    # Ровно одна identity/token, ровно одна provenance-запись (идемпотентный
+    # дубль внутри одного batch схлопывается ProvenanceStore.add_many).
+    assert len(identifier_store.entries()) == 1
+    assert len(provenance_store.entries()) == 1
+
+
+def test_repeated_coordinate_different_token_raises_provenance_conflict() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table_with_repeated_coordinate(VALID_INN, VALID_INN_2)
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+
+    with pytest.raises(ProvenanceConflictError):
+        anonymize_flat_table(
+            table,
+            rules,
+            InMemoryMappingStore(),
+            identifier_store=identifier_store,
+            provenance_store=provenance_store,
+        )
+
+    # Identifier-коммит произошёл ДО provenance-конфликта (frozen order) —
+    # обе новые identity уже в identifier_store, несмотря на то что
+    # результирующая таблица не была возвращена (принятая асимметрия).
+    assert len(identifier_store.entries()) == 2
+    assert provenance_store.entries() == ()
+
+
+def test_repeated_coordinate_same_token_different_representation_raises_provenance_conflict() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table_with_repeated_coordinate(VALID_INN, int(VALID_INN))
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+
+    with pytest.raises(ProvenanceConflictError):
+        anonymize_flat_table(
+            table,
+            rules,
+            InMemoryMappingStore(),
+            identifier_store=identifier_store,
+            provenance_store=provenance_store,
+        )
+
+    # Один и тот же token (identity совпадает у str/int) уже закоммичен в
+    # identifier_store; конфликт — только на уровне provenance representation.
+    assert len(identifier_store.entries()) == 1
+    assert provenance_store.entries() == ()
+
+
+# ---------------------------------------------------------------------------
+# L. Processing failure before commit
+# ---------------------------------------------------------------------------
+
+
+def test_processing_failure_before_commit_leaves_both_stores_untouched() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN], ["not-a-valid-inn"]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+
+    with pytest.raises(InvalidIdentifierValueError):
+        anonymize_flat_table(
+            table,
+            rules,
+            InMemoryMappingStore(),
+            identifier_store=identifier_store,
+            provenance_store=provenance_store,
+        )
+
+    assert identifier_store.entries() == ()
+    assert provenance_store.entries() == ()
+
+
+# ---------------------------------------------------------------------------
+# M. Store combinations
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_store_supplied_without_identifier_rule_stays_untouched() -> None:
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["Компания"], [["ООО Ромашка"]])
+    rules = {1: _rule("Компания", FieldType.COMPANY, Action.PSEUDONYMIZE)}
+    result = anonymize_flat_table(
+        table, rules, InMemoryMappingStore(), provenance_store=provenance_store
+    )
+    assert result.rows[0][0].value.startswith("C_")
+    assert provenance_store.entries() == ()
+
+
+def test_provenance_store_without_identifier_store_raises_when_identifier_rule_present() -> None:
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    with pytest.raises(MissingIdentifierStoreError):
+        anonymize_flat_table(table, rules, InMemoryMappingStore(), provenance_store=provenance_store)
+    assert provenance_store.entries() == ()
+
+
+def test_both_stores_supplied_full_happy_path() -> None:
+    identifier_store = InMemoryIdentifierMappingStore()
+    provenance_store = InMemoryProvenanceStore(job_id=JOB_ID)
+    table = _table("S", ["ИНН"], [[VALID_INN]])
+    rules = {1: _identifier_rule("ИНН", FieldType.INN)}
+    result = anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+    assert result.rows[0][0].value.startswith("INN_")
+    assert len(identifier_store.entries()) == 1
+    assert len(provenance_store.entries()) == 1
+
+
+# ---------------------------------------------------------------------------
+# N. Empty-batch skip — no identifier cells at all
+# ---------------------------------------------------------------------------
+
+
+def test_no_identifier_cells_skips_both_add_many_calls() -> None:
+    identifier_counter = {"n": 0}
+    provenance_counter = {"n": 0}
+
+    class _CountingIdentifierStore(InMemoryIdentifierMappingStore):
+        def add_many(self, entries):
+            identifier_counter["n"] += 1
+            super().add_many(entries)
+
+    identifier_store = _CountingIdentifierStore()
+    provenance_store = _CountingProvenanceStore(JOB_ID, provenance_counter)
+
+    table = _table(
+        "S",
+        ["Компания", "Заметка"],
+        [["ООО Ромашка", "оставить"]],
+    )
+    rules = {
+        1: _rule("Компания", FieldType.COMPANY, Action.PSEUDONYMIZE),
+        2: _rule("Заметка", FieldType.UNKNOWN, Action.KEEP),
+    }
+    anonymize_flat_table(
+        table,
+        rules,
+        InMemoryMappingStore(),
+        identifier_store=identifier_store,
+        provenance_store=provenance_store,
+    )
+
+    assert identifier_counter["n"] == 0
+    assert provenance_counter["n"] == 0
+    assert provenance_store.entries() == ()
