@@ -64,13 +64,58 @@ OD-7 (SECURITY): EncryptedFile*Store хранит password как атрибут
 
 OD-8: adopt_stores без identifier_store_path — identifier-состояние
 Workspace пустое (entry_count=0), файл отсутствует до первой мутации.
+
+======================================================================
+Stage 10B.4.1 (Contract & Architecture Review + Owner Decisions,
+frozen) — artifact allocation/staging/registration
+======================================================================
+
+allocate_artifact_path/stage_analytical_file: ТОЛЬКО резервируют
+структурно допустимое место (ArtifactSlot) — не создают запись manifest,
+не требуют лока (`artifact_id`/путь генерируются через secrets.token_hex,
+коллизия проверяется чтением ФС и практически невозможна при 128 битах
+энтропии). stage_analytical_file — специализированная обёртка над
+allocate_artifact_path(ANALYTICAL_CANONICAL) для внешнего (например,
+ChatGPT-обновлённого) workbook: копирует байты атомарно, source остаётся
+неизменным, не должен находиться внутри workspace root.
+
+register_artifact — единственная security boundary: держит лок,
+перечитывает manifest, отклоняет recovery_required, пересчитывает
+РЕАЛЬНЫЙ SHA-256 файла (не доверяет тому, что было на момент allocation),
+проверяет глобальную уникальность SHA, lineage (зеркалирует
+app.workspace.models._validate_lineage — ДОЛЖНО оставаться синхронным с
+этой frozen моделью), evidence (SafetyReport, Stage 10A) по kind,
+provenance-привязку (ТОЛЬКО для ANONYMIZED_MONTHLY). provenance_sha256
+Workspace ВСЕГДА вычисляет сама из фактических байт зашифрованного
+sidecar на диске — НЕ принимает её на доверии от вызывающего кода
+(вызывающий код передаёт только provenance_id). Зарегистрированный
+артефакт — известный, хэш-привязанный объект реестра с валидной lineage;
+это НЕ означает разрешение на отправку во внешний AI (Stage 10C).
+
+Владельческие решения (owner decisions), зафиксированные для 10B.4:
+OD-10B4-1 (latest rollback) и OD-10B4-3 (backup.json) относятся к
+10B.4.2/10B.4.3, здесь не задействованы.
+
+Correction Pass #1 (закрытие MINOR-1 Independent Adversarial Review):
+provenance_sha256 и job_id-валидация теперь гарантированно относятся к
+ОДНОМУ И ТОМУ ЖЕ неизменяемому снимку зашифрованных байт provenance-
+sidecar (один read_bytes(), хэш от него же, job_id читается через
+временную копию ЭТИХ ЖЕ байт) — устраняя возможность двух независимых
+чтений мутирующего оригинала дать несогласованную привязку "job_id от
+версии A, sha256 от версии B". См. _capture_provenance_snapshot/
+_read_job_id_from_snapshot.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
+import os
+import re
 import secrets
+import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional, Union
@@ -83,9 +128,14 @@ from app.mapping.base import (
 from app.mapping.encrypted_file import EncryptedFileMappingStore
 from app.mapping.encrypted_identifier_file import EncryptedFileIdentifierMappingStore
 from app.mapping.identifier_base import IdentifierMappingConflictError
+from app.mapping.provenance_encrypted import EncryptedFileProvenanceStore
 from app.models.entities import EntityType, MappingEntry
 from app.models.identifiers import IdentifierMappingEntry, IdentifierType
+from app.safety.external_ai import SafetyReport, sha256_file
 from app.workspace.errors import (
+    ArtifactNotFoundError,
+    ArtifactRegistrationError,
+    ArtifactRegistrationReason,
     WorkspaceAuthenticationError,
     WorkspaceBindingError,
     WorkspaceBindingReason,
@@ -104,6 +154,9 @@ from app.workspace.manifest import (
 )
 from app.workspace.models import (
     MANIFEST_SCHEMA_VERSION,
+    ArtifactKind,
+    ArtifactRecord,
+    ArtifactSlot,
     StoreRecoveryResult,
     StoreState,
     StoreSyncState,
@@ -122,6 +175,27 @@ _WORKSPACE_ENC_NAME = "workspace.enc"
 _WORKSPACE_LOCK_NAME = "workspace.lock"
 # Разрешённые в "чистом skeleton" директории (см. _ensure_clean_skeleton_or_absent).
 _STRUCTURAL_SUBDIRS = ("stores", "provenance", "safe", "local_plaintext", "backup")
+
+# Stage 10B.4.1: директории артефактов/provenance.
+_SAFE_DIRNAME = "safe"
+_LOCAL_PLAINTEXT_DIRNAME = "local_plaintext"
+_PROVENANCE_DIRNAME = "provenance"
+_ARTIFACT_EXTENSION = ".xlsx"
+_PROVENANCE_EXTENSION = ".enc"
+_ALLOCATION_MAX_ATTEMPTS = 8
+
+_HEX32_RE = re.compile(r"[0-9a-f]{32}")
+# Тот же period-формат, что заморожен в app.workspace.models._is_period
+# (не импортируется напрямую — приватная деталь другого модуля).
+_PERIOD_RE = re.compile(r"[0-9]{4}-(?:0[1-9]|1[0-2])")
+
+
+def _is_hex32(value: object) -> bool:
+    return isinstance(value, str) and _HEX32_RE.fullmatch(value) is not None
+
+
+def _is_period(value: object) -> bool:
+    return isinstance(value, str) and _PERIOD_RE.fullmatch(value) is not None
 
 
 # ----------------------------------------------------------------------
@@ -143,6 +217,20 @@ def _mapping_store_path(root: Path) -> Path:
 
 def _identifier_store_path(root: Path) -> Path:
     return root / _STORES_DIRNAME / _IDENTIFIER_FILENAME
+
+
+def _artifact_dir_for_kind(root: Path, kind: ArtifactKind) -> Path:
+    if kind is ArtifactKind.LOCAL_RESTORED:
+        return root / _LOCAL_PLAINTEXT_DIRNAME
+    return root / _SAFE_DIRNAME  # ANONYMIZED_MONTHLY и ANALYTICAL_CANONICAL — одна директория
+
+
+def _artifact_path(root: Path, kind: ArtifactKind, artifact_id: str) -> Path:
+    return _artifact_dir_for_kind(root, kind) / f"{artifact_id}{_ARTIFACT_EXTENSION}"
+
+
+def _provenance_path(root: Path, provenance_id: str) -> Path:
+    return root / _PROVENANCE_DIRNAME / f"{provenance_id}{_PROVENANCE_EXTENSION}"
 
 
 def _now_timestamp() -> str:
@@ -239,6 +327,43 @@ def _reject_path_inside(candidate: Path, container: Path) -> None:
     )
 
 
+def _reject_external_artifact_path_inside(candidate: Path, container: Path) -> None:
+    try:
+        candidate.resolve().relative_to(container.resolve())
+    except ValueError:
+        return
+    raise WorkspaceInputError(
+        "external_path не может находиться внутри workspace root"
+    )
+
+
+def _atomic_copy_file(source: Path, destination: Path) -> None:
+    """
+    Атомарная копия байт source -> destination: temp-файл в ТОЙ ЖЕ
+    директории, что и destination, потоковое копирование, fsync,
+    os.replace. Тот же паттерн, что уже используется для зашифрованных
+    сторов/manifest (Stage 4/7B.4.1/7C.3/10B.2) — destination гарантированно
+    ещё не существует (получен через allocate_artifact_path), поэтому
+    коллизии на этапе записи не предполагается.
+    """
+    directory = destination.parent
+    fd, tmp_name = tempfile.mkstemp(dir=str(directory), prefix=f".{destination.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            with open(source, "rb") as src_file:
+                shutil.copyfileobj(src_file, tmp_file)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(str(tmp_path), str(destination))
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 # ----------------------------------------------------------------------
 # Clean skeleton (create_workspace/adopt_stores retry-safety, §13/§15)
 # ----------------------------------------------------------------------
@@ -317,6 +442,25 @@ def _construct_identifier_store(path: Path, password: str) -> EncryptedFileIdent
     password = None  # noqa: F841 — зачистка чувствительного локала фрейма
     if failed:
         raise WorkspaceBindingError(WorkspaceBindingReason.STORE_UNOPENABLE)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _construct_provenance_store_for_open(path: Path, password: str) -> EncryptedFileProvenanceStore:
+    """
+    OD-7-safe открытие СУЩЕСТВУЮЩЕГО provenance sidecar (job_id не
+    передаётся — authoritative job_id читается из payload).
+    EncryptedFileProvenanceStore тоже хранит password как атрибут
+    объекта (self._password) — тот же риск и тот же приём, что и для
+    mapping/identifier сторов (Stage 10B.3 OD-7).
+    """
+    failed = False
+    try:
+        return EncryptedFileProvenanceStore(path, password)
+    except Exception:
+        failed = True
+    password = None  # noqa: F841 — зачистка чувствительного локала фрейма
+    if failed:
+        raise ArtifactRegistrationError(ArtifactRegistrationReason.PROVENANCE_INVALID)
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -480,6 +624,252 @@ def _verify_append_only(old_state: StoreState, new_state: StoreState, store, *, 
     prefix_fn = mapping_entries_prefix_digest if kind == "mapping" else identifier_entries_prefix_digest
     if prefix_fn(entries, old_state.entry_count) != old_state.prefix_digest:
         raise WorkspaceBindingError(WorkspaceBindingReason.APPEND_ONLY_VIOLATION)
+
+
+# ----------------------------------------------------------------------
+# Stage 10B.4.1: валидация register_artifact (lineage/evidence/provenance)
+#
+# Каждый хелпер отвечает ровно на один вопрос и поднимает КОНКРЕТНЫЙ
+# ArtifactRegistrationReason — генерическому ValueError модели
+# (app.workspace.models.ArtifactRecord/_validate_lineage) здесь не
+# доверяем как публичному контракту: он остаётся defense-in-depth при
+# фактическом построении WorkspaceManifest в register_artifact.
+# ----------------------------------------------------------------------
+
+
+def _validate_registration_lineage(kind: ArtifactKind, parents: list, period: str) -> None:
+    """
+    Зеркалирует app.workspace.models._validate_lineage (frozen, Stage
+    10B.1) — ДОЛЖНО оставаться синхронным с этой моделью. Дублируется
+    здесь исключительно ради точного ArtifactRegistrationReason ДО
+    попытки построить ArtifactRecord (сама модель тоже переисполнит эту
+    проверку независимо при финальной сборке manifest).
+    """
+    kinds = tuple(parent.kind for parent in parents)
+    monthly = ArtifactKind.ANONYMIZED_MONTHLY
+    canonical = ArtifactKind.ANALYTICAL_CANONICAL
+
+    if kind is monthly:
+        if kinds != ():
+            raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_LINEAGE)
+    elif kind is canonical:
+        if kinds not in ((monthly,), (canonical,), (canonical, monthly)):
+            raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_LINEAGE)
+        for parent in parents:
+            if parent.kind is monthly:
+                if parent.period != period:
+                    raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_LINEAGE)
+            else:
+                if parent.period > period:
+                    raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_LINEAGE)
+    else:  # LOCAL_RESTORED
+        if not (len(parents) == 1 and kinds[0] in (canonical, monthly)):
+            raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_LINEAGE)
+        if parents[0].period != period:
+            raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_LINEAGE)
+
+
+def _validate_evidence(kind: ArtifactKind, safety_report: object, actual_sha256: str) -> None:
+    """
+    ANONYMIZED_MONTHLY/ANALYTICAL_CANONICAL требуют SafetyReport (Stage
+    10A), чей sha256 совпадает с фактическим файлом и без блокирующих
+    findings. LOCAL_RESTORED НЕ допускает SafetyReport как evidence
+    (файл заведомо содержит восстановленные реальные значения).
+
+    Регистрация — НЕ финальная авторизация внешнего AI (Stage 10C):
+    здесь проверяется только факт наличия непротиворечивого evidence на
+    момент регистрации, не покрытие/policy/coverage.
+    """
+    if kind is ArtifactKind.LOCAL_RESTORED:
+        if safety_report is not None:
+            raise ArtifactRegistrationError(ArtifactRegistrationReason.EVIDENCE_NOT_ALLOWED)
+        return
+
+    if safety_report is None:
+        raise ArtifactRegistrationError(ArtifactRegistrationReason.EVIDENCE_REQUIRED)
+    if not isinstance(safety_report, SafetyReport):
+        raise TypeError(f"safety_report должен быть SafetyReport, получено: {type(safety_report)!r}")
+    if safety_report.sha256 != actual_sha256:
+        raise ArtifactRegistrationError(ArtifactRegistrationReason.EVIDENCE_HASH_MISMATCH)
+    if safety_report.has_blocking_findings:
+        raise ArtifactRegistrationError(ArtifactRegistrationReason.EVIDENCE_BLOCKING_FINDINGS)
+
+
+def _capture_provenance_snapshot(provenance_path: Path) -> tuple:
+    """
+    Correction Pass #1 (закрытие MINOR-1 Independent Review): захватывает
+    НЕИЗМЕНЯЕМЫЙ снимок зашифрованных байт provenance-файла ОДНИМ чтением
+    и немедленно вычисляет их SHA-256 от ЭТОГО ЖЕ буфера. Это единственный
+    источник как provenance_sha256, так и байт, которые ниже будут
+    провалидированы (через временную копию) на предмет job_id — то есть
+    "что хэшировано" и "что провалидировано" гарантированно относятся к
+    ОДНОМ И ТОМУ ЖЕ снимку, а не к двум независимым чтениям оригинального
+    (потенциально мутирующего между чтениями) пути.
+
+    Умышленно НЕ переиспользует sha256_file (тот читает файл заново
+    отдельным потоковым проходом) — здесь необходимо хэшировать ИМЕННО
+    те байты, что уже в памяти, без повторного обращения к диску.
+    """
+    failed = False
+    try:
+        snapshot = provenance_path.read_bytes()
+    except OSError:
+        failed = True
+    if failed:
+        raise ArtifactRegistrationError(ArtifactRegistrationReason.PROVENANCE_INVALID)
+    digest = hashlib.sha256(snapshot).hexdigest()
+    return snapshot, digest
+
+
+def _read_job_id_from_snapshot(provenance_path: Path, snapshot: bytes, password: str) -> str:
+    """
+    Записывает ИММУТАБЕЛЬНЫЙ снимок зашифрованных байт (и ТОЛЬКО их —
+    никогда plaintext) во временный файл РЯДОМ с оригиналом (тот же
+    паттерн atomic-write, что и везде в проекте: секретное имя через
+    tempfile.mkstemp, та же директория/файловая система), открывает его
+    через уже существующий EncryptedFileProvenanceStore (без дублирования
+    crypto/parsing-логики закрытого provenance-модуля) и возвращает
+    job_id, прочитанный ИМЕННО из этого снимка — гарантируя, что job_id и
+    SHA (см. _capture_provenance_snapshot) относятся к одним и тем же
+    байтам. Временный файл удаляется в finally независимо от исхода;
+    никогда не регистрируется как provenance workspace.
+
+    OD-7 (Correction Pass #2, закрытие MAJOR-1/MINOR-1 Focused
+    Re-Review): password — параметр этой функции, поэтому ВЕСЬ
+    операционный путь — mkstemp, открытие fd, запись, flush, fsync,
+    открытие снимка через EncryptedFileProvenanceStore — обёрнут ОДНИМ
+    try/finally, зачищающим password, начиная с ПЕРВОЙ операции функции
+    (mkstemp тоже способен поднять OSError ДО входа в защищённый блок —
+    именно этот пробел давал утечку password через frame locals при
+    сбое mkstemp). Любой сбой на пути подготовки снимка
+    (mkstemp/fdopen/write/flush/fsync) транслируется в уже существующий
+    ArtifactRegistrationError(PROVENANCE_INVALID) — сырой OSError никогда
+    не покидает эту функцию. Флаг `failed` используется вместо
+    непосредственного `raise` внутри `except`, чтобы финальный
+    санитизированный `raise` происходил СНАРУЖИ активного except-блока
+    (тот же приём, что и везде в OD-7-хелперах этого модуля) — итоговое
+    исключение не получает `__context__` от перехваченного OSError.
+    """
+    tmp_path = None
+    fd = None
+    failed = False
+    store = None
+    try:
+        try:
+            directory = provenance_path.parent
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(directory), prefix=".provenance-snapshot-", suffix=".tmp"
+            )
+        except Exception:
+            failed = True
+        else:
+            tmp_path = Path(tmp_name)
+
+        if not failed:
+            try:
+                tmp_file = os.fdopen(fd, "wb")
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                failed = True
+            else:
+                fd = None  # noqa: F841 — владение handle перешло к tmp_file
+                try:
+                    with tmp_file:
+                        tmp_file.write(snapshot)
+                        tmp_file.flush()
+                        os.fsync(tmp_file.fileno())
+                except Exception:
+                    failed = True
+
+        if not failed:
+            store = _construct_provenance_store_for_open(tmp_path, password)
+    finally:
+        password = None  # noqa: F841 — зачистка независимо от того, где произошёл сбой
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if failed:
+        raise ArtifactRegistrationError(ArtifactRegistrationReason.PROVENANCE_INVALID)
+
+    job_id = store.job_id
+    store = None  # noqa: F841 — зачистка (объект несёт _password)
+    return job_id
+
+
+def _validate_and_open_provenance(
+    root: Path,
+    password: str,
+    kind: ArtifactKind,
+    provenance_id: object,
+    source_job_id: object,
+) -> tuple:
+    """
+    Возвращает (provenance_id, provenance_sha256, source_job_id).
+
+    Для НЕ-ANONYMIZED_MONTHLY: provenance_id/source_job_id обязаны быть
+    None (PROVENANCE_NOT_ALLOWED/JOB_ID_INVALID иначе), результат — три
+    None.
+
+    Для ANONYMIZED_MONTHLY: provenance_id/source_job_id обязаны быть
+    заданы и иметь формат 32 lowercase hex; provenance sidecar по
+    производному пути обязан существовать, быть обычным non-reparse
+    файлом. Захватывается ОДИН неизменяемый снимок его зашифрованных
+    байт (_capture_provenance_snapshot); provenance_sha256 вычисляется
+    ИЗ ЭТОГО снимка, и job_id читается (через временную копию ТЕХ ЖЕ
+    байт) ТОЖЕ ИЗ ЭТОГО снимка — Correction Pass #1 закрывает возможность
+    зарегистрировать ArtifactRecord, где провалидированный job_id
+    относится к одной версии файла, а provenance_sha256 — к другой.
+    provenance_sha256 Workspace ВСЕГДА вычисляет САМА — не принимает её
+    на доверии от вызывающего кода (у register_artifact нет такого
+    параметра вовсе).
+    """
+    # OD-7: весь остаток функции держит `password` живым локалом кадра —
+    # ЛЮБОЙ raise ниже (включая ранние, до какого-либо использования
+    # password) обязан происходить внутри try/finally, зачищающего его,
+    # иначе пароль остаётся достижим через traceback этого кадра (тот же
+    # класс дефекта, что был найден и закрыт в _diagnose_store, Stage
+    # 10B.3 Correction Pass).
+    try:
+        if kind is not ArtifactKind.ANONYMIZED_MONTHLY:
+            if provenance_id is not None:
+                raise ArtifactRegistrationError(ArtifactRegistrationReason.PROVENANCE_NOT_ALLOWED)
+            if source_job_id is not None:
+                raise ArtifactRegistrationError(ArtifactRegistrationReason.JOB_ID_INVALID)
+            return None, None, None
+
+        if provenance_id is None:
+            raise ArtifactRegistrationError(ArtifactRegistrationReason.PROVENANCE_REQUIRED)
+        if not _is_hex32(provenance_id):
+            raise ArtifactRegistrationError(ArtifactRegistrationReason.PROVENANCE_INVALID)
+        if not _is_hex32(source_job_id):
+            raise ArtifactRegistrationError(ArtifactRegistrationReason.JOB_ID_INVALID)
+
+        provenance_path = _provenance_path(root, provenance_id)
+        if (
+            _is_reparse_like(provenance_path)
+            or not provenance_path.exists()
+            or not provenance_path.is_file()
+        ):
+            raise ArtifactRegistrationError(ArtifactRegistrationReason.PROVENANCE_INVALID)
+
+        snapshot, provenance_sha256 = _capture_provenance_snapshot(provenance_path)
+        try:
+            actual_job_id = _read_job_id_from_snapshot(provenance_path, snapshot, password)
+        finally:
+            snapshot = None  # noqa: F841 — зачистка (зашифрованный, но незачем задерживать в памяти)
+    finally:
+        password = None  # noqa: F841 — зачистка сразу после открытия (успех или нет)
+
+    if actual_job_id != source_job_id:
+        raise ArtifactRegistrationError(ArtifactRegistrationReason.JOB_ID_INVALID)
+
+    return provenance_id, provenance_sha256, source_job_id
 
 
 # ----------------------------------------------------------------------
@@ -883,6 +1273,197 @@ class Workspace:
         finally:
             password = None  # noqa: F841
             self._file_lock.release()
+
+    # ------------------------------------------------------------------
+    # Stage 10B.4.1: artifact allocation / staging / registration
+    # ------------------------------------------------------------------
+
+    def allocate_artifact_path(self, kind: ArtifactKind) -> ArtifactSlot:
+        """
+        Резервирует структурно допустимое место для потенциального
+        артефакта — ТОЛЬКО путь+ID, никакого файла не создаёт, manifest
+        не мутирует, лок не требуется (artifact_id — secrets.token_hex(16),
+        коллизия с уже существующим файлом практически невозможна при
+        128 битах энтропии; retry на явную проверку — defense-in-depth,
+        не защита от реальной угрозы).
+        """
+        if not isinstance(kind, ArtifactKind):
+            raise WorkspaceInputError("kind должен быть ArtifactKind")
+
+        root = self._root
+        _reject_unsafe_dir(_artifact_dir_for_kind(root, kind))
+
+        for _ in range(_ALLOCATION_MAX_ATTEMPTS):
+            artifact_id = secrets.token_hex(16)
+            path = _artifact_path(root, kind, artifact_id)
+            if not path.exists():
+                return ArtifactSlot(artifact_id=artifact_id, kind=kind, path=path)
+        raise WorkspaceInputError(
+            "не удалось выделить уникальный artifact_id за отведённое число попыток"
+        )
+
+    def stage_analytical_file(self, external_path: Union[str, Path]) -> ArtifactSlot:
+        """
+        Копирует ВНЕШНИЙ (например, обновлённый внешним AI) workbook в
+        свежий кандидатный слот ANALYTICAL_CANONICAL. Staging НЕ означает
+        "доверенный/безопасный/зарегистрированный" — только физическое
+        перемещение байт в допустимое место; source остаётся неизменным
+        и не должен находиться внутри workspace root.
+        """
+        external = _validate_path_like_argument(external_path, name="external_path")
+        if _is_reparse_like(external) or not external.exists() or not external.is_file():
+            raise WorkspaceInputError("external_path должен быть обычным существующим файлом")
+        if external.suffix.lower() != _ARTIFACT_EXTENSION:
+            raise WorkspaceInputError(f"external_path должен иметь расширение {_ARTIFACT_EXTENSION}")
+        _reject_external_artifact_path_inside(external, self._root)
+
+        slot = self.allocate_artifact_path(ArtifactKind.ANALYTICAL_CANONICAL)
+        _atomic_copy_file(external, slot.path)
+        return slot
+
+    def register_artifact(
+        self,
+        slot: ArtifactSlot,
+        *,
+        period: str,
+        parent_artifact_ids: tuple = (),
+        source_job_id: Optional[str] = None,
+        provenance_id: Optional[str] = None,
+        safety_report: Optional[SafetyReport] = None,
+    ) -> ArtifactRecord:
+        """
+        Единственная security boundary регистрации артефакта. Держит
+        лок, перечитывает manifest, отклоняет recovery_required,
+        пересчитывает РЕАЛЬНЫЙ SHA-256 файла (не доверяет allocation-
+        времени), проверяет глобальную уникальность SHA, lineage,
+        evidence по kind, provenance-привязку (ANONYMIZED_MONTHLY).
+        Registered ≠ авторизован для внешнего AI (Stage 10C).
+        """
+        if not isinstance(slot, ArtifactSlot):
+            raise WorkspaceInputError("slot должен быть ArtifactSlot")
+        if not isinstance(parent_artifact_ids, tuple) or not all(
+            isinstance(parent_id, str) for parent_id in parent_artifact_ids
+        ):
+            raise WorkspaceInputError("parent_artifact_ids должен быть tuple[str, ...]")
+
+        self._file_lock.acquire()
+        try:
+            root = self._root
+            password = self._password
+            try:
+                # Перечитываем АКТУАЛЬНЫЙ manifest под локом — та же
+                # дисциплина против stale Workspace объектов, что и
+                # store_mutation()/recover_store_state() (Stage 10B.3).
+                manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+                if manifest.pending_store_mutation:
+                    raise WorkspaceBindingError(WorkspaceBindingReason.RECOVERY_REQUIRED)
+
+                expected_path = _artifact_path(root, slot.kind, slot.artifact_id)
+                if slot.path != expected_path:
+                    raise ArtifactRegistrationError(ArtifactRegistrationReason.SLOT_INVALID)
+                if (
+                    _is_reparse_like(slot.path)
+                    or not slot.path.exists()
+                    or not slot.path.is_file()
+                ):
+                    raise ArtifactRegistrationError(ArtifactRegistrationReason.FILE_INVALID)
+
+                actual_sha256 = sha256_file(slot.path)
+                existing_sha256 = {record.sha256 for record in manifest.artifacts}
+                if actual_sha256 in existing_sha256:
+                    raise ArtifactRegistrationError(ArtifactRegistrationReason.DUPLICATE_SHA256)
+
+                if not _is_period(period):
+                    raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_PERIOD)
+
+                if len(set(parent_artifact_ids)) != len(parent_artifact_ids):
+                    raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_LINEAGE)
+                if slot.artifact_id in parent_artifact_ids:
+                    raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_LINEAGE)
+
+                by_id = {record.artifact_id: record for record in manifest.artifacts}
+                parents = []
+                for parent_id in parent_artifact_ids:
+                    if parent_id not in by_id:
+                        raise ArtifactRegistrationError(ArtifactRegistrationReason.INVALID_LINEAGE)
+                    parents.append(by_id[parent_id])
+
+                _validate_registration_lineage(slot.kind, parents, period)
+                _validate_evidence(slot.kind, safety_report, actual_sha256)
+                (
+                    final_provenance_id,
+                    final_provenance_sha256,
+                    final_source_job_id,
+                ) = _validate_and_open_provenance(
+                    root, password, slot.kind, provenance_id, source_job_id
+                )
+
+                record = ArtifactRecord(
+                    artifact_id=slot.artifact_id,
+                    kind=slot.kind,
+                    sha256=actual_sha256,
+                    created_at=_now_timestamp(),
+                    parent_artifact_ids=parent_artifact_ids,
+                    period=period,
+                    source_job_id=final_source_job_id,
+                    provenance_id=final_provenance_id,
+                    provenance_sha256=final_provenance_sha256,
+                )
+                new_manifest = dataclasses.replace(
+                    manifest,
+                    revision=manifest.revision + 1,
+                    artifacts=manifest.artifacts + (record,),
+                )
+                save_encrypted_manifest_atomic(_workspace_enc_path(root), new_manifest, password)
+            finally:
+                password = None  # noqa: F841
+            self._manifest = new_manifest
+            return record
+        finally:
+            self._file_lock.release()
+
+    # ------------------------------------------------------------------
+    # Stage 10B.4.1: read-only доступ к реестру артефактов
+    # ------------------------------------------------------------------
+
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord:
+        if not isinstance(artifact_id, str):
+            raise WorkspaceInputError("artifact_id должен быть str")
+
+        root = self._root
+        password = self._password
+        try:
+            manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+        finally:
+            password = None  # noqa: F841
+        self._manifest = manifest
+
+        for record in manifest.artifacts:
+            if record.artifact_id == artifact_id:
+                return record
+        raise ArtifactNotFoundError()
+
+    def list_artifacts(
+        self, *, kind: Optional[ArtifactKind] = None, period: Optional[str] = None
+    ) -> tuple:
+        if kind is not None and not isinstance(kind, ArtifactKind):
+            raise WorkspaceInputError("kind должен быть ArtifactKind")
+        if period is not None and not isinstance(period, str):
+            raise WorkspaceInputError("period должен быть str")
+
+        root = self._root
+        password = self._password
+        try:
+            manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+        finally:
+            password = None  # noqa: F841
+        self._manifest = manifest
+
+        return tuple(
+            record
+            for record in manifest.artifacts
+            if (kind is None or record.kind is kind) and (period is None or record.period == period)
+        )
 
 
 # ----------------------------------------------------------------------
