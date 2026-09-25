@@ -1660,10 +1660,65 @@ def test_production_imports_are_restricted(module) -> None:
     assert not any(name.startswith(("app.safety", "app.mapping", "app.security", "openpyxl")) for name in imported)
 
 
-def test_package_init_is_docstring_only() -> None:
+def test_package_exports_stage10b3_public_api() -> None:
+    """
+    Заменяет устаревший (Stage 10B.1) test_package_init_is_docstring_only
+    -- Correction Pass #1, owner decision по BLOCKER-1: начиная со
+    Stage 10B.3 app/workspace/__init__.py НАМЕРЕННО перестал быть только
+    docstring и экспортирует публичный API Workspace-слоя. Этот тест
+    фиксирует НОВЫЙ (актуальный) контракт пакета вместо старого.
+    """
     import app.workspace as package
+    import app.workspace.workspace as workspace_module
 
-    tree = ast.parse(Path(package.__file__).read_text(encoding="utf-8"))
-    assert len(tree.body) == 1
-    assert isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Constant)
-    assert isinstance(tree.body[0].value.value, str)
+    assert package.__all__ == ["Workspace", "create_workspace", "open_workspace", "adopt_stores"]
+
+    # Каждое публичное имя пакета -- это ТОТ ЖЕ объект, что определён в
+    # app.workspace.workspace, а не копия/переопределение.
+    assert package.Workspace is workspace_module.Workspace
+    assert package.create_workspace is workspace_module.create_workspace
+    assert package.open_workspace is workspace_module.open_workspace
+    assert package.adopt_stores is workspace_module.adopt_stores
+
+    # Ни один внутренний helper/façade/санитизирующая функция Stage10B.3
+    # не должны быть случайно доступны через сам пакет (например, из-за
+    # неосторожного `from app.workspace.workspace import *`).
+    forbidden_internal_names = (
+        "MappingMutationFacade",
+        "IdentifierMutationFacade",
+        "MappingStoreReader",
+        "IdentifierMappingStoreReader",
+        "_diagnose_store",
+        "_construct_mapping_store",
+        "_construct_identifier_store",
+        "_mapping_store_add",
+        "_identifier_store_add",
+        "_identifier_store_add_many",
+        "_sanitized_store_read",
+        "_verify_append_only",
+        "_compute_mapping_state",
+        "_compute_identifier_state",
+        "_ensure_clean_skeleton_or_absent",
+        "_ensure_structural_subdirs",
+        "_validate_layout_safety",
+        "_reject_unsafe_dir",
+        "_reject_unsafe_file",
+        "_is_reparse_like",
+        "_reject_path_inside",
+        "_validate_creation_password",
+        "_validate_open_password",
+        "_validate_source_password_argument",
+        "_validate_path_like_argument",
+        "MIN_CREATION_PASSWORD_LENGTH",
+    )
+    for name in forbidden_internal_names:
+        assert not hasattr(package, name), f"внутреннее имя {name!r} не должно быть доступно через app.workspace"
+
+    # Публичных имён пакета -- ровно 4, если не считать dunder-атрибуты и
+    # submodule-биндинги (errors/locking/manifest/models/storage/workspace),
+    # которые Python создаёт как побочный эффект импорта подмодулей ГДЕ
+    # УГОДНО в процессе -- это стандартное поведение пакетов, а не утечка.
+    public_non_dunder = {name for name in vars(package) if not name.startswith("__")}
+    known_submodule_bindings = {"errors", "locking", "manifest", "models", "storage", "workspace"}
+    unexpected = public_non_dunder - set(package.__all__) - known_submodule_bindings
+    assert unexpected == set(), f"неожиданные публичные имена в app.workspace: {unexpected}"
