@@ -156,6 +156,70 @@ Owner decisions (Contract Review, frozen):
 Явный rollback latest-указателя на артефакт более раннего period
 РАЗРЕШЁН (OD-10B4-1, зафиксировано в Stage 10B.4 Contract Review) —
 period при этом не сравнивается и не проверяется автоматически.
+
+======================================================================
+Stage 10B.4.3 (Contract & Architecture Review + Owner Decisions,
+frozen) — backup сторов + Workspace verify
+======================================================================
+
+snapshot_stores — снимает backup workspace.enc + mapping.enc/
+identifiers.enc (только при их физическом наличии, OD-10B4-4/zero-store
+rule) под workspace.lock, отклоняя recovery_required. Backup НЕ durable-
+запись manifest: revision+0, save_encrypted_manifest_atomic не
+вызывается. Имя backup — f"{revision:08d}-{secrets.token_hex(4)}"
+(формат заморожен app.workspace.models._BACKUP_NAME); публикация —
+атомарный os.replace() ЦЕЛОЙ temp-директории внутри backup/ (эмпирически
+подтверждено на Windows/Python 3.13). После публикации выполняется
+retention (OD-10B4.3-4): удаление старых backup ТЕКУЩЕГО workspace сверх
+keep_last (OD-10B4.3-5: первичный ключ revision, вторичный — полное имя,
+дубликаты revision разрешены); сбой удаления НЕ откатывает уже
+опубликованный snapshot, но snapshot_stores() поднимает исключение (raw
+OSError — тот же принцип, что save_encrypted_manifest_atomic/
+_atomic_write: файловые сбои проходят как есть, новый WorkspaceError не
+изобретается).
+
+verify_backup(name) — полная structural+cryptographic верификация ОДНОГО
+backup по имени (не Path — формат имени структурно исключает выход за
+пределы backup/). BACKUP_INVALID — любое структурное/крипто расхождение;
+BACKUP_FOREIGN — ТОЛЬКО если backup-manifest успешно прочитан, но его
+workspace_id не совпадает с текущим (foreign никогда не смешивается с
+invalid). Backup workspace.enc читается ОДНИМ вызовом
+load_encrypted_manifest (single-snapshot discipline, тот же принцип, что
+Correction Pass #1 Stage 10B.4.1) — workspace_id и StoreState берутся из
+одного и того же результата. Store-проверка — FULL count+digest, не
+recovery-prefix semantics. Никакого restore.
+
+list_backups() — metadata-listing (OD-10B4.3-2): читает backup-manifest
+каждого backup с валидным именем, принадлежащего текущему workspace,
+достаточно для BackupInfo — НЕ проверяет store bytes/digests (это
+исключительно задача verify_backup()). Invalid-name, crash-temp
+(".snapshot-*.tmp"), reparse, unreadable/tampered, foreign записи МОЛЧА
+игнорируются (OD-10B4.3-3) — они никогда не удаляются и никогда не
+выглядят как доверенный backup текущего workspace.
+
+verify() — диагностический (НЕ security-gate) снимок целостности
+workspace под workspace.lock, использующий ЕДИНЫЙ manifest-snapshot,
+загруженный под этим же локом (не переиспользует
+verified_artifact_path()/verified_provenance_path(), которые сами
+перечитывают manifest — это сломало бы consistent snapshot). OD-10B4.3-1
+(Вариант B): обычные layout-нарушения (reparse/wrong-type на
+существующем structural path) -> layout_ok=False; полное отсутствие
+обязательной structural-директории -> raise
+WorkspaceCorruptedError(LAYOUT_INCOMPLETE) (дальнейшая диагностика
+бессмысленна). OD-10B4.3-6: reparse/wrong-type на ЗАРЕГИСТРИРОВАННОМ
+artifact/provenance пути -> missing-счётчик + layout_ok=False;
+ОБЫЧНЫЙ незарегистрированный файл (включая неожиданное расширение) ->
+orphan_file_count (НЕ layout/integrity). orphan_file_count остаётся
+исключительно информационным полем (frozen owner decision, models.py) —
+has_integrity_problems его не учитывает. Store-binding-диагностика
+переиспользует _diagnose_store как есть: CONSISTENT/AHEAD отражаются
+мягко в mapping_sync/identifier_sync (frozen StoreSyncState — только эти
+два значения), но более серьёзное расхождение (STORE_DIVERGED/
+STORE_MISSING/STORE_UNOPENABLE/...), которое эта модель не может
+выразить без потери информации, по-прежнему поднимает
+WorkspaceBindingError как есть (задокументированное ограничение словаря
+модели, не blocker). verify() НЕ является external-AI authorization ни в
+каком виде — Stage 10C выполняет это отдельно.
 """
 
 from __future__ import annotations
@@ -194,6 +258,7 @@ from app.workspace.errors import (
     WorkspaceBindingReason,
     WorkspaceCorruptedError,
     WorkspaceCorruptedReason,
+    WorkspaceError,
     WorkspaceInputError,
     WorkspaceLockedError,
     WorkspaceNotFoundError,
@@ -210,12 +275,14 @@ from app.workspace.models import (
     ArtifactKind,
     ArtifactRecord,
     ArtifactSlot,
+    BackupInfo,
     ProvenanceSlot,
     StoreRecoveryResult,
     StoreState,
     StoreSyncState,
     WorkspaceInfo,
     WorkspaceManifest,
+    WorkspaceVerification,
 )
 from app.workspace.storage import load_encrypted_manifest, save_encrypted_manifest_atomic
 
@@ -238,10 +305,116 @@ _ARTIFACT_EXTENSION = ".xlsx"
 _PROVENANCE_EXTENSION = ".enc"
 _ALLOCATION_MAX_ATTEMPTS = 8
 
+# Stage 10B.4.3: backup.
+_BACKUP_DIRNAME = "backup"
+
 _HEX32_RE = re.compile(r"[0-9a-f]{32}")
 # Тот же period-формат, что заморожен в app.workspace.models._is_period
 # (не импортируется напрямую — приватная деталь другого модуля).
 _PERIOD_RE = re.compile(r"[0-9]{4}-(?:0[1-9]|1[0-2])")
+# Тот же формат backup-имени, что заморожен в app.workspace.models._BACKUP_NAME.
+_BACKUP_NAME_RE = re.compile(r"[0-9]{8}-[0-9a-f]{8}")
+
+# Correction Pass (закрытие MINOR-5 Focused Independent Review):
+# фиксированные, СОБСТВЕННЫЕ (project-owned) части temp-имени. НЕ
+# специфицируют алфавит/длину opaque random-компонента, который целиком
+# генерирует tempfile.mkstemp — это приватная деталь реализации CPython
+# (tempfile._RandomNameSequence), а не документированный публичный
+# контракт tempfile.mkstemp, и наша production-семантика намеренно от
+# неё не зависит.
+_TEMP_NAME_SUFFIX = ".tmp"
+_PROVENANCE_SNAPSHOT_TEMP_PREFIX = ".provenance-snapshot-"
+
+
+def _is_valid_backup_name(value: object) -> bool:
+    return isinstance(value, str) and _BACKUP_NAME_RE.fullmatch(value) is not None
+
+
+def _is_opaque_temp_component(value: str) -> bool:
+    """
+    Correction Pass (MINOR-5): непустой opaque random-компонент temp-
+    имени — единственное требование, НЕ привязанное к алфавиту/длине
+    конкретной реализации tempfile: непустой, не содержит разделителей
+    пути и NUL-байта (остаётся единственным filename-компонентом).
+    """
+    return bool(value) and "/" not in value and "\\" not in value and "\x00" not in value
+
+
+def _is_recognized_temp_name(name: str, expected_names: frozenset) -> bool:
+    """
+    Correction Pass (закрытие MINOR-1 Independent Adversarial Review,
+    затем сужение random-компонента в MINOR-5 Focused Independent
+    Review): распознаёт ТОЛЬКО реальные internal crash-temp naming
+    templates, которые Workspace (либо сотрудничающий provenance-writer,
+    app.mapping.provenance_encrypted, пишущий в ЭТУ ЖЕ директорию по
+    тому же паттерну) легитимно может оставить ИМЕННО в проверяемой
+    директории (safe/local_plaintext/provenance) — НЕ произвольный
+    ".*.tmp" (прежняя, слишком широкая версия предиката).
+
+    Инвентаризация фактических temp-writer'ов проекта (перепроверено по
+    коду, не по памяти):
+
+        app.workspace.storage._atomic_write            -> workspace root,
+            ".workspace.enc.<random>.tmp" (директория не сканируется
+            verify() на orphan вообще — не относится к этому предикату).
+        app.mapping.encrypted_file / encrypted_identifier_file ->
+            stores/, ".mapping.enc.<random>.tmp" /
+            ".identifiers.enc.<random>.tmp" (stores/ тоже не сканируется
+            на orphan).
+        app.mapping.provenance_encrypted._atomic_write  -> provenance/,
+            ".<provenance_id>.enc.<random>.tmp" (target.name — ИМЯ
+            РЕАЛЬНОГО provenance sidecar).
+        workspace._read_job_id_from_snapshot            -> provenance/,
+            фиксированный литеральный префикс
+            ".provenance-snapshot-<random>.tmp" (не привязан к
+            конкретному target).
+        workspace._atomic_copy_file (stage_analytical_file) -> safe/,
+            ".<artifact_id>.xlsx.<random>.tmp" (target.name — ИМЯ
+            РЕАЛЬНОГО артефакта). local_plaintext/ на сегодня не имеет
+            production-writer'а через _atomic_copy_file, но паттерн
+            структурно идентичен на случай будущего использования —
+            распознаётся по тому же принципу (привязка к expected_names).
+        workspace._publish_backup_snapshot              -> backup/,
+            ".snapshot-<random>.tmp" (ДИРЕКТОРИЯ) — backup/ НЕ входит в
+            orphan-scan verify() вообще (list_backups() уже имеет
+            ОТДЕЛЬНУЮ crash-temp semantics через _is_valid_backup_name —
+            эта функция здесь не расширяется и не переиспользуется для
+            backup/).
+
+    <random> везде генерируется ЦЕЛИКОМ tempfile.mkstemp — эта функция
+    НЕ проверяет его алфавит/длину (MINOR-5: это приватная деталь
+    CPython, не публичный контракт), только то, что он непустой и
+    остаётся единственным filename-компонентом
+    (_is_opaque_temp_component). Признаются РОВНО два шаблона:
+
+    1. ".provenance-snapshot-<opaque>.tmp" — фиксированный литеральный
+       префикс (project-owned), opaque-часть должна быть непустой
+       (иначе ".provenance-snapshot-.tmp"/".provenance-snapshot.tmp" —
+       НЕ распознаются, считаются orphan).
+    2. ".<known_name>.<opaque>.tmp", где known_name — ТОЧНОЕ имя уже
+       ЗАРЕГИСТРИРОВАННОГО (ожидаемого) файла В ЭТОЙ ЖЕ директории
+       (member множества expected_names, переданного вызывающим кодом
+       для конкретной директории/kind). Именно привязка к
+       expected_names — основная защита от false positive, а не формат
+       opaque-части. Temp-имя, "похожее" на артефакт/provenance, но для
+       НЕсуществующего/незарегистрированного target ИЛИ зарегистрированное
+       в ДРУГОЙ директории, НЕ распознаётся намеренно.
+
+    Ничего шире не распознаётся.
+    """
+    if name.startswith(_PROVENANCE_SNAPSHOT_TEMP_PREFIX) and name.endswith(_TEMP_NAME_SUFFIX):
+        random_component = name[len(_PROVENANCE_SNAPSHOT_TEMP_PREFIX):-len(_TEMP_NAME_SUFFIX)]
+        if _is_opaque_temp_component(random_component):
+            return True
+
+    if not (name.startswith(".") and name.endswith(_TEMP_NAME_SUFFIX)):
+        return False
+    middle = name[1:-len(_TEMP_NAME_SUFFIX)]
+    for known_name in expected_names:
+        prefix = f"{known_name}."
+        if middle.startswith(prefix) and _is_opaque_temp_component(middle[len(prefix):]):
+            return True
+    return False
 
 
 def _is_hex32(value: object) -> bool:
@@ -959,6 +1132,267 @@ def _sha256_or_integrity_error(path: Path) -> str:
     if failed:
         raise ArtifactIntegrityError()
     return result
+
+
+# ----------------------------------------------------------------------
+# Stage 10B.4.3: backup verification helpers
+# ----------------------------------------------------------------------
+
+
+def _load_backup_manifest_or_invalid(manifest_path: Path, password: str) -> WorkspaceManifest:
+    """
+    Single-snapshot discipline (тот же принцип, что Correction Pass #1
+    Stage 10B.4.1): ОДИН вызов load_encrypted_manifest — единственное
+    чтение файла — используется и для workspace_id, и для StoreState;
+    два независимых чтения одного и того же backup workspace.enc не
+    делаются. Любая ошибка store/manifest-слоя транслируется в единый
+    BACKUP_INVALID (OD-7: except-блок покидается до raise fresh).
+    """
+    try:
+        failed = False
+        manifest = None
+        try:
+            manifest = load_encrypted_manifest(manifest_path, password)
+        except WorkspaceError:
+            failed = True
+        if failed:
+            raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_INVALID)
+    finally:
+        password = None  # noqa: F841
+    return manifest
+
+
+def _verify_backup_store_or_invalid(
+    path: Optional[Path], expected_state: StoreState, password: str, *, store_kind: str
+) -> None:
+    """
+    Полная (НЕ recovery-prefix) проверка одного backup-стора: точное
+    совпадение count И full digest с StoreState backup-manifest'а.
+    Вызывается ТОЛЬКО когда expected_state.entry_count > 0 и path не
+    None — отсутствие файла при entry_count == 0 (OD-10B4-4) проверяется
+    структурно вызывающим кодом ДО этого вызова.
+    """
+    try:
+        if path is None or _is_reparse_like(path) or not path.exists() or not path.is_file():
+            raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_INVALID)
+
+        failed = False
+        store = None
+        try:
+            if store_kind == "mapping":
+                store = _construct_mapping_store(path, password)
+            else:
+                store = _construct_identifier_store(path, password)
+        except WorkspaceBindingError:
+            failed = True
+        if failed:
+            raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_INVALID)
+
+        try:
+            entries = _sanitized_store_read(store.entries)
+        finally:
+            store = None  # noqa: F841 — зачистка (объект несёт _password)
+
+        prefix_fn = mapping_entries_prefix_digest if store_kind == "mapping" else identifier_entries_prefix_digest
+        if len(entries) != expected_state.entry_count or prefix_fn(entries) != expected_state.prefix_digest:
+            raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_INVALID)
+    finally:
+        password = None  # noqa: F841
+
+
+def _verify_backup_structure(backup_dir: Path, current_workspace_id: str, password: str) -> BackupInfo:
+    """
+    Полная structural+cryptographic верификация одного backup (Stage
+    10B.4.3). Единственная допустимая структура:
+
+        backup/<name>/workspace.enc
+        backup/<name>/stores/mapping.enc       (если mapping count > 0)
+        backup/<name>/stores/identifiers.enc   (если identifier count > 0)
+
+    Любое отклонение (лишние/отсутствующие записи, reparse, wrong-type,
+    count/digest mismatch) -> BACKUP_INVALID. workspace_id backup-
+    manifest'а не совпадает с текущим -> BACKUP_FOREIGN — проверяется
+    ТОЛЬКО ПОСЛЕ того, как manifest успешно прочитан (foreign не
+    смешивается с invalid: нельзя сравнить workspace_id, который не
+    удалось прочитать).
+    """
+    try:
+        if _is_reparse_like(backup_dir) or not backup_dir.exists() or not backup_dir.is_dir():
+            raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_INVALID)
+
+        manifest_path = backup_dir / _WORKSPACE_ENC_NAME
+        if _is_reparse_like(manifest_path) or not manifest_path.exists() or not manifest_path.is_file():
+            raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_INVALID)
+
+        backup_manifest = _load_backup_manifest_or_invalid(manifest_path, password)
+
+        if backup_manifest.workspace_id != current_workspace_id:
+            raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_FOREIGN)
+
+        mapping_count = backup_manifest.mapping_state.entry_count
+        identifier_count = backup_manifest.identifier_state.entry_count
+        stores_expected = mapping_count > 0 or identifier_count > 0
+
+        allowed_top = {_WORKSPACE_ENC_NAME}
+        if stores_expected:
+            allowed_top.add(_STORES_DIRNAME)
+        top_entries = {entry.name for entry in backup_dir.iterdir()}
+        if top_entries != allowed_top:
+            raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_INVALID)
+
+        if stores_expected:
+            stores_dir = backup_dir / _STORES_DIRNAME
+            if _is_reparse_like(stores_dir) or not stores_dir.exists() or not stores_dir.is_dir():
+                raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_INVALID)
+
+            allowed_store_files = set()
+            if mapping_count > 0:
+                allowed_store_files.add(_MAPPING_FILENAME)
+            if identifier_count > 0:
+                allowed_store_files.add(_IDENTIFIER_FILENAME)
+            store_entries = {entry.name for entry in stores_dir.iterdir()}
+            if store_entries != allowed_store_files:
+                raise WorkspaceCorruptedError(WorkspaceCorruptedReason.BACKUP_INVALID)
+
+            if mapping_count > 0:
+                _verify_backup_store_or_invalid(
+                    stores_dir / _MAPPING_FILENAME, backup_manifest.mapping_state, password, store_kind="mapping",
+                )
+            if identifier_count > 0:
+                _verify_backup_store_or_invalid(
+                    stores_dir / _IDENTIFIER_FILENAME, backup_manifest.identifier_state, password, store_kind="identifier",
+                )
+    finally:
+        password = None  # noqa: F841
+
+    return BackupInfo(
+        name=backup_dir.name,
+        revision=backup_manifest.revision,
+        mapping_entry_count=mapping_count,
+        identifier_entry_count=identifier_count,
+    )
+
+
+def _scan_backup_candidates(backup_root: Path, current_workspace_id: str, password: str) -> list:
+    """
+    Перечисляет backup/-записи с ВАЛИДНЫМ именем формата _BACKUP_NAME_RE,
+    принадлежащие ТЕКУЩЕМУ workspace (workspace_id совпадает после
+    успешной расшифровки manifest'а единственным чтением). Invalid-name,
+    crash-temp, reparse, unreadable/tampered и foreign записи МОЛЧА
+    исключаются — они никогда не становятся ни элементом list_backups(),
+    ни retention-кандидатом (OD-10B4.3-2/3, §19). Возвращает список
+    (WorkspaceManifest, Path).
+    """
+    try:
+        results = []
+        if not backup_root.exists():
+            return results
+        for entry in backup_root.iterdir():
+            if not _is_valid_backup_name(entry.name):
+                continue
+            if _is_reparse_like(entry) or not entry.is_dir():
+                continue
+            manifest_path = entry / _WORKSPACE_ENC_NAME
+            if _is_reparse_like(manifest_path) or not manifest_path.exists() or not manifest_path.is_file():
+                continue
+            try:
+                backup_manifest = load_encrypted_manifest(manifest_path, password)
+            except WorkspaceError:
+                continue
+            if backup_manifest.workspace_id != current_workspace_id:
+                continue
+            results.append((backup_manifest, entry))
+        return results
+    finally:
+        password = None  # noqa: F841
+
+
+def _publish_backup_snapshot(root: Path, backup_root: Path, manifest: WorkspaceManifest) -> BackupInfo:
+    """
+    Публикует новый backup-снимок: temp-директория ВНУТРИ backup/ (та же
+    файловая система) -> копирование workspace.enc (+ store-файлов, если
+    их count > 0) -> os.replace(temp, final) — единственная атомарная
+    публикация ЦЕЛОЙ директории (эмпирически подтверждено на Windows/
+    Python 3.13: source exists/destination absent/одна ФС -> атомарный
+    rename; destination уже существует как непустая директория -> OSError,
+    ничего не подменяется частично). Manifest revision НЕ меняется —
+    backup не является durable-записью manifest.
+    """
+    mapping_count = manifest.mapping_state.entry_count
+    identifier_count = manifest.identifier_state.entry_count
+    stores_needed = mapping_count > 0 or identifier_count > 0
+
+    final_dir = None
+    name = None
+    for _ in range(_ALLOCATION_MAX_ATTEMPTS):
+        candidate_name = f"{manifest.revision:08d}-{secrets.token_hex(4)}"
+        candidate_dir = backup_root / candidate_name
+        if not candidate_dir.exists():
+            final_dir = candidate_dir
+            name = candidate_name
+            break
+    if final_dir is None:
+        raise WorkspaceInputError(
+            "не удалось выделить уникальное имя backup за отведённое число попыток"
+        )
+
+    temp_dir = Path(tempfile.mkdtemp(dir=str(backup_root), prefix=".snapshot-", suffix=".tmp"))
+    try:
+        _atomic_copy_file(_workspace_enc_path(root), temp_dir / _WORKSPACE_ENC_NAME)
+        if stores_needed:
+            (temp_dir / _STORES_DIRNAME).mkdir()
+            if mapping_count > 0:
+                _atomic_copy_file(_mapping_store_path(root), temp_dir / _STORES_DIRNAME / _MAPPING_FILENAME)
+            if identifier_count > 0:
+                _atomic_copy_file(
+                    _identifier_store_path(root), temp_dir / _STORES_DIRNAME / _IDENTIFIER_FILENAME
+                )
+        os.replace(str(temp_dir), str(final_dir))
+    except Exception:
+        shutil.rmtree(str(temp_dir), ignore_errors=True)
+        raise
+
+    return BackupInfo(
+        name=name,
+        revision=manifest.revision,
+        mapping_entry_count=mapping_count,
+        identifier_entry_count=identifier_count,
+    )
+
+
+def _apply_backup_retention(backup_root: Path, workspace_id: str, keep_last: int, password: str) -> None:
+    """
+    OD-10B4.3-4/5: удаляет старые backup ТЕКУЩЕГО workspace (invalid-
+    name/foreign/tampered НИКОГДА не удаляются — они не входят в
+    _scan_backup_candidates), сортируя по (revision, name) детерминированно.
+    Уже опубликованный новый snapshot НЕ откатывается при сбое удаления —
+    ошибка удаления какого-либо старого backup поднимается ПОСЛЕ того,
+    как password этой функции уже зачищен (retention deletion сама по
+    себе пароля не использует). Используется существующий, уже принятый
+    в проекте паттерн: primary error не маскируется secondary cleanup
+    failure (см. WorkspaceFileLock.release()) — raw OSError не
+    оборачивается в новый WorkspaceError (тот же принцип, что
+    save_encrypted_manifest_atomic/_atomic_write: файловые сбои проходят
+    как есть).
+    """
+    try:
+        candidates = _scan_backup_candidates(backup_root, workspace_id, password)
+        candidates.sort(key=lambda item: (item[0].revision, item[1].name))
+        if len(candidates) <= keep_last:
+            return
+        to_delete = [entry for _, entry in candidates[: len(candidates) - keep_last]]
+    finally:
+        password = None  # noqa: F841
+
+    first_error = None
+    for path in to_delete:
+        try:
+            shutil.rmtree(str(path))
+        except OSError as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
 
 # ----------------------------------------------------------------------
@@ -1735,6 +2169,248 @@ class Workspace:
                 password = None  # noqa: F841
             self._manifest = new_manifest
             return record
+        finally:
+            self._file_lock.release()
+
+    # ------------------------------------------------------------------
+    # Stage 10B.4.3: backup snapshot / verification / workspace verify
+    # ------------------------------------------------------------------
+
+    def snapshot_stores(self, *, keep_last: int = 5) -> BackupInfo:
+        """
+        Снимает backup сторов (workspace.enc + mapping.enc/identifiers.enc
+        при их наличии) под workspace.lock. Отклоняет recovery_required
+        (та же мутационная дисциплина, что register_artifact/
+        set_latest_analytical). Backup НЕ является durable-записью
+        manifest: revision +0, save_encrypted_manifest_atomic не
+        вызывается. После публикации выполняет retention (OD-10B4.3-4):
+        если новый backup опубликован, но удаление старых не удалось —
+        метод поднимает исключение, НЕ откатывая уже опубликованный
+        snapshot и не восстанавливая удалённые.
+        """
+        if isinstance(keep_last, bool) or not isinstance(keep_last, int):
+            raise WorkspaceInputError("keep_last должен быть int")
+        if keep_last < 1:
+            raise WorkspaceInputError("keep_last должен быть не меньше 1")
+
+        self._file_lock.acquire()
+        try:
+            root = self._root
+            password = self._password
+            try:
+                manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+                if manifest.pending_store_mutation:
+                    raise WorkspaceBindingError(WorkspaceBindingReason.RECOVERY_REQUIRED)
+
+                # Live store binding ДО snapshot — с pending=False любое
+                # расхождение поднимает WorkspaceBindingError как есть
+                # (та же семантика, что open_workspace/store_mutation).
+                _, mapping_store = _diagnose_store(
+                    manifest.mapping_state, _mapping_store_path(root), password, False, store_kind="mapping",
+                )
+                mapping_store = None  # noqa: F841 — зачистка (несёт _password), дальше не нужен
+                _, identifier_store = _diagnose_store(
+                    manifest.identifier_state, _identifier_store_path(root), password, False, store_kind="identifier",
+                )
+                identifier_store = None  # noqa: F841
+
+                backup_root = root / _BACKUP_DIRNAME
+                if _is_reparse_like(backup_root) or not backup_root.exists() or not backup_root.is_dir():
+                    raise WorkspaceCorruptedError(WorkspaceCorruptedReason.UNSAFE_LAYOUT)
+
+                backup_info = _publish_backup_snapshot(root, backup_root, manifest)
+                _apply_backup_retention(backup_root, manifest.workspace_id, keep_last, password)
+            finally:
+                password = None  # noqa: F841
+            self._manifest = manifest
+            return backup_info
+        finally:
+            self._file_lock.release()
+
+    def verify_backup(self, name: str) -> BackupInfo:
+        """
+        Полная structural+cryptographic верификация ОДНОГО backup по его
+        имени (НЕ Path — формат имени структурно исключает выход за
+        пределы backup/). Не требует lock (backup неизменяем после
+        публикации в рамках этого API). BACKUP_INVALID для любого
+        структурного/криптографического расхождения; BACKUP_FOREIGN
+        только если backup-manifest успешно прочитан, но его workspace_id
+        не совпадает с текущим. Никакого restore.
+        """
+        if not _is_valid_backup_name(name):
+            raise WorkspaceInputError("name должен быть корректным именем backup")
+
+        root = self._root
+        password = self._password
+        try:
+            manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+            self._manifest = manifest
+            backup_dir = root / _BACKUP_DIRNAME / name
+            return _verify_backup_structure(backup_dir, manifest.workspace_id, password)
+        finally:
+            password = None  # noqa: F841
+
+    def list_backups(self) -> tuple[BackupInfo, ...]:
+        """
+        Metadata-listing (OD-10B4.3-2): читает backup-manifest каждого
+        backup с ВАЛИДНЫМ именем, принадлежащего текущему workspace,
+        достаточно для BackupInfo — НЕ проверяет store bytes/digests
+        (это исключительно задача verify_backup()). Invalid-name,
+        crash-temp, reparse, unreadable/tampered и foreign записи
+        МОЛЧА игнорируются (OD-10B4.3-3) — они никогда не выглядят как
+        доверенный backup текущего workspace. Ничего не удаляет.
+        Сортировка — по (revision, name), детерминированная.
+        """
+        root = self._root
+        password = self._password
+        try:
+            manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+            self._manifest = manifest
+            candidates = _scan_backup_candidates(root / _BACKUP_DIRNAME, manifest.workspace_id, password)
+        finally:
+            password = None  # noqa: F841
+
+        infos = [
+            BackupInfo(
+                name=entry.name,
+                revision=backup_manifest.revision,
+                mapping_entry_count=backup_manifest.mapping_state.entry_count,
+                identifier_entry_count=backup_manifest.identifier_state.entry_count,
+            )
+            for backup_manifest, entry in candidates
+        ]
+        infos.sort(key=lambda info: (info.revision, info.name))
+        return tuple(infos)
+
+    def verify(self) -> WorkspaceVerification:
+        """
+        Диагностический (НЕ security-gate) снимок целостности workspace
+        под workspace.lock (OD-10B4.3-1, Вариант B): обычные layout-
+        нарушения (reparse/symlink/junction/wrong-type на существующем
+        structural path) отражаются как layout_ok=False, а не немедленным
+        исключением. Полное отсутствие обязательной structural-директории
+        делает дальнейшую диагностику бессмысленной -> raise
+        WorkspaceCorruptedError(LAYOUT_INCOMPLETE). Не проверяет
+        физические байты provenance повторным decrypt — только SHA-256
+        зарегистрированных зашифрованных байт. НЕ является external-AI
+        authorization ни в каком виде.
+        """
+        self._file_lock.acquire()
+        try:
+            root = self._root
+            password = self._password
+            try:
+                manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+
+                for dirname in _STRUCTURAL_SUBDIRS:
+                    if not (root / dirname).exists():
+                        raise WorkspaceCorruptedError(WorkspaceCorruptedReason.LAYOUT_INCOMPLETE)
+
+                layout_ok = True
+                for dirname in (
+                    _STORES_DIRNAME, _PROVENANCE_DIRNAME, _SAFE_DIRNAME, _LOCAL_PLAINTEXT_DIRNAME, _BACKUP_DIRNAME,
+                ):
+                    dir_path = root / dirname
+                    if _is_reparse_like(dir_path) or not dir_path.is_dir():
+                        layout_ok = False
+
+                mapping_sync, mapping_store = _diagnose_store(
+                    manifest.mapping_state, _mapping_store_path(root), password,
+                    manifest.pending_store_mutation, store_kind="mapping",
+                )
+                mapping_store = None  # noqa: F841
+                identifier_sync, identifier_store = _diagnose_store(
+                    manifest.identifier_state, _identifier_store_path(root), password,
+                    manifest.pending_store_mutation, store_kind="identifier",
+                )
+                identifier_store = None  # noqa: F841
+
+                artifacts_missing = 0
+                artifacts_hash_mismatch = 0
+                provenance_missing = 0
+                provenance_hash_mismatch = 0
+
+                safe_expected: set = set()
+                local_expected: set = set()
+                provenance_expected: set = set()
+
+                for record in manifest.artifacts:
+                    target = _artifact_path(root, record.kind, record.artifact_id)
+                    if record.kind is ArtifactKind.LOCAL_RESTORED:
+                        local_expected.add(target.name)
+                    else:
+                        safe_expected.add(target.name)
+
+                    if _is_reparse_like(target):
+                        layout_ok = False
+                        artifacts_missing += 1
+                    elif not target.exists() or not target.is_file():
+                        artifacts_missing += 1
+                    else:
+                        try:
+                            actual_sha256 = sha256_file(target)
+                        except OSError:
+                            artifacts_missing += 1
+                        else:
+                            if actual_sha256 != record.sha256:
+                                artifacts_hash_mismatch += 1
+
+                    if record.provenance_id is not None:
+                        prov_target = _provenance_path(root, record.provenance_id)
+                        provenance_expected.add(prov_target.name)
+
+                        if _is_reparse_like(prov_target):
+                            layout_ok = False
+                            provenance_missing += 1
+                        elif not prov_target.exists() or not prov_target.is_file():
+                            provenance_missing += 1
+                        else:
+                            try:
+                                actual_prov_sha256 = sha256_file(prov_target)
+                            except OSError:
+                                provenance_missing += 1
+                            else:
+                                if actual_prov_sha256 != record.provenance_sha256:
+                                    provenance_hash_mismatch += 1
+
+                orphan_file_count = 0
+                for directory, expected_names in (
+                    (root / _SAFE_DIRNAME, safe_expected),
+                    (root / _LOCAL_PLAINTEXT_DIRNAME, local_expected),
+                    (root / _PROVENANCE_DIRNAME, provenance_expected),
+                ):
+                    if _is_reparse_like(directory) or not directory.is_dir():
+                        continue  # уже отражено в layout_ok выше — вглубь не сканируем
+                    for entry in directory.iterdir():
+                        if entry.name in expected_names:
+                            continue
+                        if _is_recognized_temp_name(entry.name, expected_names):
+                            continue
+                        if _is_reparse_like(entry):
+                            layout_ok = False
+                        elif entry.is_dir():
+                            layout_ok = False
+                        elif entry.is_file():
+                            orphan_file_count += 1
+                        else:
+                            layout_ok = False
+            finally:
+                password = None  # noqa: F841
+
+            self._manifest = manifest
+            return WorkspaceVerification(
+                revision=manifest.revision,
+                mapping_sync=mapping_sync,
+                identifier_sync=identifier_sync,
+                recovery_required=manifest.pending_store_mutation,
+                layout_ok=layout_ok,
+                artifact_count=len(manifest.artifacts),
+                artifacts_missing=artifacts_missing,
+                artifacts_hash_mismatch=artifacts_hash_mismatch,
+                provenance_missing=provenance_missing,
+                provenance_hash_mismatch=provenance_hash_mismatch,
+                orphan_file_count=orphan_file_count,
+            )
         finally:
             self._file_lock.release()
 
