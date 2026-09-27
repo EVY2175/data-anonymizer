@@ -104,6 +104,58 @@ sidecar (один read_bytes(), хэш от него же, job_id читаетс
 чтений мутирующего оригинала дать несогласованную привязку "job_id от
 версии A, sha256 от версии B". См. _capture_provenance_snapshot/
 _read_job_id_from_snapshot.
+
+======================================================================
+Stage 10B.4.2 (Contract & Architecture Review + Owner Decisions,
+frozen) — provenance allocation / verified paths / latest analytical
+pointer
+======================================================================
+
+allocate_provenance_path — точная зеркальная копия allocate_artifact_path
+(Stage 10B.4.1) для ProvenanceSlot: только provenance_id+путь, файл не
+создаётся, EncryptedFileProvenanceStore не конструируется, manifest не
+мутирует, лок не требуется.
+
+verified_artifact_path/verified_provenance_path — integrity accessors:
+перечитывают manifest, выводят ожидаемый физический путь ТОЛЬКО из
+зарегистрированных record.kind/record.artifact_id (или provenance_id),
+пересчитывают реальный SHA-256 и сравнивают с зарегистрированным.
+Работают для ЛЮБОГО ArtifactKind, включая LOCAL_RESTORED — без
+искусственного запрета. verified_provenance_path НЕ расшифровывает
+provenance повторно (хэш — от сырых зашифрованных байт) и не проверяет
+job_id повторно; глобальная уникальность provenance_id уже гарантирована
+_validate_artifact_graph (models.py, frozen Stage 10B.1) и здесь не
+дублируется. "Verified" означает СТРОГО "физические байты соответствуют
+зарегистрированному SHA" — НЕ safe/can_upload/authorized для внешнего AI
+(Stage 10C).
+
+latest_analytical_artifact — чистый metadata-getter указателя; не
+проверяет physical file/hash (за этим — отдельный вызов
+verified_artifact_path). WorkspaceManifest уже гарантирует
+(_validate_artifact_graph), что указатель, если задан, ссылается на
+существующую запись с kind is ANALYTICAL_CANONICAL.
+
+set_latest_analytical — единственная мутация указателя: держит лок,
+перечитывает manifest, отклоняет recovery_required, требует
+ANALYTICAL_CANONICAL (POINTER_KIND_INVALID иначе), revision+1.
+
+Owner decisions (Contract Review, frozen):
+    OD-10B4.2-1 — повторный set_latest_analytical на уже текущий
+        artifact_id НЕ является idempotent no-op: всё равно revision+1
+        и durable save (Вариант B).
+    OD-10B4.2-2 — verified_artifact_path/verified_provenance_path/
+        latest_analytical_artifact НЕ берут workspace.lock (read-only;
+        Stage 10B.4.3 Workspace.verify() — отдельный, более сильный
+        consistent-snapshot контракт под lock).
+    OD-10B4.2-3 — read-only методы этого слайса (включая
+        allocate_provenance_path) разрешены при
+        pending_store_mutation=True/recovery_required=True и не
+        выполняют recovery/repair/adopt; set_latest_analytical, будучи
+        мутацией, обязан fail closed через RECOVERY_REQUIRED.
+
+Явный rollback latest-указателя на артефакт более раннего period
+РАЗРЕШЁН (OD-10B4-1, зафиксировано в Stage 10B.4 Contract Review) —
+period при этом не сравнивается и не проверяется автоматически.
 """
 
 from __future__ import annotations
@@ -133,6 +185,7 @@ from app.models.entities import EntityType, MappingEntry
 from app.models.identifiers import IdentifierMappingEntry, IdentifierType
 from app.safety.external_ai import SafetyReport, sha256_file
 from app.workspace.errors import (
+    ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactRegistrationError,
     ArtifactRegistrationReason,
@@ -157,6 +210,7 @@ from app.workspace.models import (
     ArtifactKind,
     ArtifactRecord,
     ArtifactSlot,
+    ProvenanceSlot,
     StoreRecoveryResult,
     StoreState,
     StoreSyncState,
@@ -873,6 +927,41 @@ def _validate_and_open_provenance(
 
 
 # ----------------------------------------------------------------------
+# Stage 10B.4.2: integrity-accessor helper
+# ----------------------------------------------------------------------
+
+
+def _sha256_or_integrity_error(path: Path) -> str:
+    """
+    Хэш физического таргета для verified_*-accessor'ов. sha256_file
+    пропускает ошибки ввода-вывода как есть (см. app.safety.external_ai)
+    — сырой OSError, чей текст включает абсолютный путь, никогда не
+    покидает эту функцию как есть (та же дисциплина, что и на остальных
+    публичных границах этого модуля: текст исключений нижних слоёв
+    никогда не пропускается наружу).
+
+    OD-7-класс приём (тот же, что и в _construct_mapping_store и
+    остальных OD-7-хелперах этого модуля): `except`-блок ПОКИДАЕТСЯ до
+    того, как поднимается свежее исключение — `raise ... from None`
+    ВНУТРИ активного except очищает только __cause__, implicit exception
+    chaining интерпретатора всё равно устанавливает __context__ нового
+    исключения на перехваченный OSError, пока raise происходит внутри
+    этого блока (экспериментально подтверждено при отладке этого
+    хелпера). Только выход из except ДО конструирования нового
+    исключения даёт __context__ is None без ручной перезаписи атрибута.
+    """
+    failed = False
+    result = ""
+    try:
+        result = sha256_file(path)
+    except OSError:
+        failed = True
+    if failed:
+        raise ArtifactIntegrityError()
+    return result
+
+
+# ----------------------------------------------------------------------
 # Read-only reader façades (OD-4) — структурно без методов мутации.
 # ----------------------------------------------------------------------
 
@@ -1464,6 +1553,190 @@ class Workspace:
             for record in manifest.artifacts
             if (kind is None or record.kind is kind) and (period is None or record.period == period)
         )
+
+    # ------------------------------------------------------------------
+    # Stage 10B.4.2: provenance allocation / verified paths / latest
+    # analytical pointer
+    # ------------------------------------------------------------------
+
+    def allocate_provenance_path(self) -> ProvenanceSlot:
+        """
+        Резервирует структурно допустимое место для потенциального
+        provenance sidecar — точная зеркальная копия
+        allocate_artifact_path (Stage 10B.4.1): ТОЛЬКО provenance_id+путь,
+        никакого файла не создаёт, EncryptedFileProvenanceStore не
+        конструирует, manifest не мутирует, лок не требуется
+        (provenance_id — secrets.token_hex(16), коллизия с уже
+        существующим файлом практически невозможна при 128 битах
+        энтропии; retry на явную проверку — defense-in-depth).
+        """
+        root = self._root
+        _reject_unsafe_dir(root / _PROVENANCE_DIRNAME)
+
+        for _ in range(_ALLOCATION_MAX_ATTEMPTS):
+            provenance_id = secrets.token_hex(16)
+            path = _provenance_path(root, provenance_id)
+            if not path.exists():
+                return ProvenanceSlot(provenance_id=provenance_id, path=path)
+        raise WorkspaceInputError(
+            "не удалось выделить уникальный provenance_id за отведённое число попыток"
+        )
+
+    def verified_artifact_path(self, artifact_id: str) -> Path:
+        """
+        Integrity accessor (Stage 10B.4.2, OD-10B4.2-2/3): перечитывает
+        manifest с диска (БЕЗ workspace.lock — read-only, разрешён при
+        pending_store_mutation=True), находит зарегистрированную запись,
+        выводит ожидаемый физический путь ТОЛЬКО из record.kind/
+        record.artifact_id (через уже существующий _artifact_path),
+        пересчитывает реальный SHA-256 и сравнивает с record.sha256.
+        Возвращает Path только при полном совпадении — для ЛЮБОГО из
+        трёх ArtifactKind, включая LOCAL_RESTORED (намеренно, без
+        искусственного запрета).
+
+        Означает СТРОГО "физические байты соответствуют
+        зарегистрированному SHA" — НЕ safe/can_upload/authorized для
+        внешнего AI (Stage 10C).
+        """
+        if not isinstance(artifact_id, str):
+            raise WorkspaceInputError("artifact_id должен быть str")
+
+        root = self._root
+        password = self._password
+        try:
+            manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+        finally:
+            password = None  # noqa: F841
+        self._manifest = manifest
+
+        record = None
+        for candidate in manifest.artifacts:
+            if candidate.artifact_id == artifact_id:
+                record = candidate
+                break
+        if record is None:
+            raise ArtifactNotFoundError()
+
+        path = _artifact_path(root, record.kind, record.artifact_id)
+        if _is_reparse_like(path) or not path.exists() or not path.is_file():
+            raise ArtifactIntegrityError()
+
+        if _sha256_or_integrity_error(path) != record.sha256:
+            raise ArtifactIntegrityError()
+        return path
+
+    def verified_provenance_path(self, provenance_id: str) -> Path:
+        """
+        Integrity accessor (Stage 10B.4.2) для provenance sidecar
+        зарегистрированного ANONYMIZED_MONTHLY артефакта. Глобальная
+        уникальность provenance_id среди артефактов уже гарантирована
+        _validate_artifact_graph (models.py, frozen Stage 10B.1) — эта
+        функция не дублирует ту проверку. Хэш считается от СЫРЫХ
+        зашифрованных байт (sha256_file, как и для .xlsx-артефактов) —
+        provenance НЕ расшифровывается повторно, job_id НЕ проверяется
+        повторно.
+        """
+        if not isinstance(provenance_id, str):
+            raise WorkspaceInputError("provenance_id должен быть str")
+
+        root = self._root
+        password = self._password
+        try:
+            manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+        finally:
+            password = None  # noqa: F841
+        self._manifest = manifest
+
+        record = None
+        for candidate in manifest.artifacts:
+            if candidate.provenance_id == provenance_id:
+                record = candidate
+                break
+        if record is None:
+            raise ArtifactNotFoundError()
+
+        path = _provenance_path(root, provenance_id)
+        if _is_reparse_like(path) or not path.exists() or not path.is_file():
+            raise ArtifactIntegrityError()
+
+        if _sha256_or_integrity_error(path) != record.provenance_sha256:
+            raise ArtifactIntegrityError()
+        return path
+
+    def latest_analytical_artifact(self) -> Optional[ArtifactRecord]:
+        """
+        Читает указатель на текущий "последний" ANALYTICAL_CANONICAL
+        (перечитывает manifest с диска, БЕЗ lock — read-only, разрешён
+        при pending_store_mutation=True). WorkspaceManifest уже
+        гарантирует (models.py._validate_artifact_graph, frozen), что
+        указатель, если задан, ссылается на существующую запись с
+        kind is ANALYTICAL_CANONICAL — повторная проверка здесь не
+        требуется. Физический файл/хэш НЕ проверяется (за этим —
+        отдельный вызов verified_artifact_path); это НЕ upload-
+        авторизация.
+        """
+        root = self._root
+        password = self._password
+        try:
+            manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+        finally:
+            password = None  # noqa: F841
+        self._manifest = manifest
+
+        pointer = manifest.latest_analytical_artifact_id
+        if pointer is None:
+            return None
+        for candidate in manifest.artifacts:
+            if candidate.artifact_id == pointer:
+                return candidate
+        raise AssertionError("unreachable")  # pragma: no cover — гарантировано _validate_artifact_graph
+
+    def set_latest_analytical(self, artifact_id: str) -> ArtifactRecord:
+        """
+        Единственная мутация "последнего аналитического" указателя
+        (Stage 10B.4.2). Держит лок, ПЕРВОЙ операцией перечитывает
+        manifest, отклоняет recovery_required (OD-10B4.2-3 — в отличие
+        от read-only методов этого слайса), требует kind
+        ANALYTICAL_CANONICAL (POINTER_KIND_INVALID иначе). Явный
+        rollback на более ранний period РАЗРЕШЁН (OD-10B4-1) — period не
+        сравнивается. Повторный вызов с уже текущим artifact_id ВСЁ
+        РАВНО считается успешной мутацией: revision+1, durable save, без
+        idempotent-ветки (OD-10B4.2-1, Вариант B, frozen).
+        """
+        if not isinstance(artifact_id, str):
+            raise WorkspaceInputError("artifact_id должен быть str")
+
+        self._file_lock.acquire()
+        try:
+            root = self._root
+            password = self._password
+            try:
+                manifest = load_encrypted_manifest(_workspace_enc_path(root), password)
+                if manifest.pending_store_mutation:
+                    raise WorkspaceBindingError(WorkspaceBindingReason.RECOVERY_REQUIRED)
+
+                record = None
+                for candidate in manifest.artifacts:
+                    if candidate.artifact_id == artifact_id:
+                        record = candidate
+                        break
+                if record is None:
+                    raise ArtifactNotFoundError()
+                if record.kind is not ArtifactKind.ANALYTICAL_CANONICAL:
+                    raise ArtifactRegistrationError(ArtifactRegistrationReason.POINTER_KIND_INVALID)
+
+                new_manifest = dataclasses.replace(
+                    manifest,
+                    revision=manifest.revision + 1,
+                    latest_analytical_artifact_id=artifact_id,
+                )
+                save_encrypted_manifest_atomic(_workspace_enc_path(root), new_manifest, password)
+            finally:
+                password = None  # noqa: F841
+            self._manifest = new_manifest
+            return record
+        finally:
+            self._file_lock.release()
 
 
 # ----------------------------------------------------------------------
