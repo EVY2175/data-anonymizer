@@ -212,6 +212,69 @@ _NUMBER_FORMAT_FALLBACK_OTHER = "0.00"
 # (Final Contract Freeze Pass §10-11).
 _DA_STYLE_NAME_TEMPLATE = "DAStyle{index:04d}"
 
+# BLOCKER Correction Pass (NamedStyle builtinId bypass): точный,
+# независимо сверенный с реальным openpyxl.styles.builtins.styles
+# (openpyxl==3.1.5) список ВСЕХ 49 доверенных пар (name, builtinId).
+# Доверие к built-in статусу стиля требует EXACT PAIR MATCH -- ни
+# `builtinId is not None` сам по себе, ни `name` само по себе не
+# являются достаточным доказательством: произвольный (name, builtinId)
+# со SPOOFED non-None builtinId (не входящим в этот список, либо не
+# соответствующим этому конкретному name) ранее позволял confidential
+# имени пережить scrub под видом "built-in" стиля.
+_TRUSTED_BUILTIN_STYLE_PAIRS = frozenset(
+    {
+        ("Normal", 0),
+        ("Comma", 3),
+        ("Currency", 4),
+        ("Percent", 5),
+        ("Comma [0]", 6),
+        ("Currency [0]", 7),
+        ("Hyperlink", 8),
+        ("Followed Hyperlink", 9),
+        ("Note", 10),
+        ("Warning Text", 11),
+        ("Title", 15),
+        ("Headline 1", 16),
+        ("Headline 2", 17),
+        ("Headline 3", 18),
+        ("Headline 4", 19),
+        ("Input", 20),
+        ("Output", 21),
+        ("Calculation", 22),
+        ("Check Cell", 23),
+        ("Linked Cell", 24),
+        ("Total", 25),
+        ("Good", 26),
+        ("Bad", 27),
+        ("Neutral", 28),
+        ("Accent1", 29),
+        ("20 % - Accent1", 30),
+        ("40 % - Accent1", 31),
+        ("60 % - Accent1", 32),
+        ("Accent2", 33),
+        ("20 % - Accent2", 34),
+        ("40 % - Accent2", 35),
+        ("60 % - Accent2", 36),
+        ("Accent3", 37),
+        ("20 % - Accent3", 38),
+        ("40 % - Accent3", 39),
+        ("60 % - Accent3", 40),
+        ("Accent4", 41),
+        ("20 % - Accent4", 42),
+        ("40 % - Accent4", 43),
+        ("60 % - Accent4", 44),
+        ("Accent5", 45),
+        ("20 % - Accent5", 46),
+        ("40 % - Accent5", 47),
+        ("60 % - Accent5", 48),
+        ("Accent6", 49),
+        ("20 % - Accent6", 50),
+        ("40 % - Accent6", 51),
+        ("60 % - Accent6", 52),
+        ("Explanatory Text", 53),
+    }
+)
+
 # Fixed safe значения для TableStyleList.defaultTableStyle/
 # defaultPivotStyle (Final Contract Freeze Pass §15) -- эмпирически
 # подтверждено, что это НЕ constrained enum, а обычный String(), поэтому
@@ -368,18 +431,30 @@ def _sanitize_number_format_registry(workbook) -> None:
 def _sanitize_named_styles(workbook) -> None:
     """
     `workbook._named_styles` (private): нет public API для итерации+
-    переименования зарегистрированных NamedStyle-объектов. `builtinId`
-    (не имя!) -- надёжный, не завязанный на строку маркер built-in
-    Excel-стиля (Final Contract Freeze Pass §10-11). Custom-стили
-    (builtinId is None) получают детерминированное нейтральное имя --
-    исходное имя НИКОГДА не используется как основа/часть нового.
+    переименования зарегистрированных NamedStyle-объектов.
+
+    BLOCKER Correction Pass (NamedStyle builtinId bypass): доверие к
+    built-in статусу стиля требует EXACT PAIR MATCH (`name`, `builtinId`)
+    против `_TRUSTED_BUILTIN_STYLE_PAIRS` -- эмпирически доказано, что
+    проверка ТОЛЬКО `builtinId is not None` (прежняя логика) позволяла
+    произвольному confidential `name` пережить scrub, если ему был
+    присвоен ЛЮБОЙ non-None `builtinId` (spoofed/unknown/reserved
+    значение, либо known `builtinId` с несоответствующим `name`).
+
+    Любой NamedStyle БЕЗ exact pair match считается untrusted и
+    получает: (а) детерминированное нейтральное имя (исходное имя
+    НИКОГДА не используется как основа/часть нового); (б)
+    `builtinId = None` -- иначе результат остался бы семантически
+    "built-in" со spoofed маркером даже после переименования. Оба шага
+    обязательны и неразделимы.
     """
     custom_index = 0
     for named_style in workbook._named_styles:
-        if named_style.builtinId is not None:
+        if (named_style.name, named_style.builtinId) in _TRUSTED_BUILTIN_STYLE_PAIRS:
             continue
         custom_index += 1
         named_style.name = _DA_STYLE_NAME_TEMPLATE.format(index=custom_index)
+        named_style.builtinId = None
 
 
 def _clear_differential_styles(workbook) -> None:

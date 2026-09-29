@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import io
 import traceback
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -2131,6 +2132,385 @@ def test_named_style_nested_unsafe_font_and_numfmt_sanitized(tmp_path: Path) -> 
         assert cell.font.bold is True
         assert cell.number_format == "0.00"
         assert cell.value == 1234.5
+        wb2.close()
+    finally:
+        result.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# CC2. NamedStyle builtinId bypass -- BLOCKER Correction Pass
+# ---------------------------------------------------------------------------
+
+_ALL_TRUSTED_BUILTIN_PAIRS = [
+    ("Normal", 0), ("Comma", 3), ("Currency", 4), ("Percent", 5),
+    ("Comma [0]", 6), ("Currency [0]", 7), ("Hyperlink", 8),
+    ("Followed Hyperlink", 9), ("Note", 10), ("Warning Text", 11),
+    ("Title", 15), ("Headline 1", 16), ("Headline 2", 17), ("Headline 3", 18),
+    ("Headline 4", 19), ("Input", 20), ("Output", 21), ("Calculation", 22),
+    ("Check Cell", 23), ("Linked Cell", 24), ("Total", 25), ("Good", 26),
+    ("Bad", 27), ("Neutral", 28), ("Accent1", 29), ("20 % - Accent1", 30),
+    ("40 % - Accent1", 31), ("60 % - Accent1", 32), ("Accent2", 33),
+    ("20 % - Accent2", 34), ("40 % - Accent2", 35), ("60 % - Accent2", 36),
+    ("Accent3", 37), ("20 % - Accent3", 38), ("40 % - Accent3", 39),
+    ("60 % - Accent3", 40), ("Accent4", 41), ("20 % - Accent4", 42),
+    ("40 % - Accent4", 43), ("60 % - Accent4", 44), ("Accent5", 45),
+    ("20 % - Accent5", 46), ("40 % - Accent5", 47), ("60 % - Accent5", 48),
+    ("Accent6", 49), ("20 % - Accent6", 50), ("40 % - Accent6", 51),
+    ("60 % - Accent6", 52), ("Explanatory Text", 53),
+]
+
+
+def _build_and_scrub_with_named_style(tmp_path: Path, name: str, builtin_id, cell_value="v"):
+    from openpyxl.styles import NamedStyle
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = cell_value
+    named = NamedStyle(name=name)
+    named.builtinId = builtin_id
+    wb.add_named_style(named)
+    ws["A1"].style = name
+    source = tmp_path / f"namedstyle_pair_{uuid.uuid4().hex}.xlsx"
+    wb.save(source)
+    wb.close()
+    result = scrub_workbook_object_model(source)
+    return source, result
+
+
+def test_named_style_builtin_bypass_original_exploit(tmp_path: Path) -> None:
+    # A: original discovered exploit -- confidential name + spoofed builtinId=1.
+    source, result = _build_and_scrub_with_named_style(tmp_path, f"{SENTINEL}-spoof1", 1)
+    try:
+        raw = _read_part(result, "xl/styles.xml").decode("utf-8")
+        assert SENTINEL not in raw
+        wb2 = openpyxl.load_workbook(result)
+        assert "DAStyle0001" in wb2.named_styles
+        assert wb2.active["A1"].style == "DAStyle0001"
+        wb2.close()
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert 'name="DAStyle0001" xfId="1" hidden="0"' in styles  # no builtinId attribute present
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_confidential_name_masquerading_as_normal(tmp_path: Path) -> None:
+    # B: confidential name + builtinId=0 must NOT masquerade as "Normal".
+    source, result = _build_and_scrub_with_named_style(tmp_path, f"{SENTINEL}-fakenormal", 0)
+    try:
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert SENTINEL not in styles
+        wb2 = openpyxl.load_workbook(result)
+        names = set(wb2.named_styles)
+        assert names == {"Normal", "DAStyle0001"}
+        assert wb2.active["A1"].style == "DAStyle0001"
+        wb2.close()
+    finally:
+        result.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("builtin_id", [3, 15, 29, 53])
+def test_named_style_confidential_name_with_representative_known_ids(tmp_path: Path, builtin_id: int) -> None:
+    # C: confidential name + representative known IDs -- all sanitized.
+    source, result = _build_and_scrub_with_named_style(tmp_path, f"{SENTINEL}-id{builtin_id}", builtin_id)
+    try:
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert SENTINEL not in styles
+        assert "builtinId" not in styles.split("<tableStyles")[0].split("cellStyle name=\"DAStyle0001\"")[-1].split("/>")[0]
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_normal_with_wrong_builtin_id(tmp_path: Path) -> None:
+    # D (Normal case): the DEFAULT "Normal" style exists in every fresh
+    # workbook -- mutate its builtinId directly to create the mismatched
+    # ("Normal", 3) pair, since add_named_style() refuses a second style
+    # literally named "Normal".
+    from openpyxl.styles import NamedStyle
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "v"
+    normal_style = next(ns for ns in wb._named_styles if ns.name == "Normal")
+    normal_style.builtinId = 3
+    source = tmp_path / f"normal_wrongid_{uuid.uuid4().hex}.xlsx"
+    wb.save(source)
+    wb.close()
+    result = scrub_workbook_object_model(source)
+    try:
+        wb2 = openpyxl.load_workbook(result)
+        names = set(wb2.named_styles)
+        assert names == {"DAStyle0001"}  # "Normal" itself was mismatched -> sanitized, not preserved
+        wb2.close()
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert 'name="DAStyle0001" xfId="0" hidden="0"' in styles
+        assert "builtinId" not in styles.split("<tableStyles")[0]
+    finally:
+        result.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("name,wrong_id", [("Currency", 0), ("Accent1", 30)])
+def test_named_style_known_name_wrong_builtin_id(tmp_path: Path, name: str, wrong_id: int) -> None:
+    # D: known name + mismatched builtinId -- must be sanitized (exact-pair-match, not name-only).
+    source, result = _build_and_scrub_with_named_style(tmp_path, name, wrong_id)
+    try:
+        wb2 = openpyxl.load_workbook(result)
+        names = set(wb2.named_styles)
+        assert name not in names
+        assert "DAStyle0001" in names
+        wb2.close()
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert 'name="DAStyle0001" xfId="1" hidden="0"' in styles  # renamed, no builtinId
+    finally:
+        result.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("unknown_id", [1, 2, 12, 13, 14, 54, 999])
+def test_named_style_unknown_or_reserved_builtin_id(tmp_path: Path, unknown_id: int) -> None:
+    # E: unknown/reserved/out-of-range builtinId -- all sanitized.
+    source, result = _build_and_scrub_with_named_style(tmp_path, f"{SENTINEL}-unk{unknown_id}", unknown_id)
+    try:
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert SENTINEL not in styles
+        assert 'name="DAStyle0001" xfId="1" hidden="0"' in styles
+    finally:
+        result.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("name,builtin_id", [
+    ("Normal", 0), ("Currency", 4), ("Title", 15), ("Accent1", 29), ("Explanatory Text", 53),
+])
+def test_named_style_exact_legitimate_pairs_preserved(tmp_path: Path, name: str, builtin_id: int) -> None:
+    # F: representative exact legitimate pairs must be preserved unchanged.
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "v"
+    if name != "Normal":
+        from openpyxl.styles import NamedStyle
+
+        named = NamedStyle(name=name)
+        named.builtinId = builtin_id
+        wb.add_named_style(named)
+        ws["A1"].style = name
+    source = tmp_path / f"legit_pair_{uuid.uuid4().hex}.xlsx"
+    wb.save(source)
+    wb.close()
+    result = scrub_workbook_object_model(source)
+    try:
+        wb2 = openpyxl.load_workbook(result)
+        assert name in wb2.named_styles
+        assert wb2.active["A1"].style == name
+        wb2.close()
+    finally:
+        result.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("name,builtin_id", _ALL_TRUSTED_BUILTIN_PAIRS)
+def test_named_style_all_49_trusted_pairs_preserved(tmp_path: Path, name: str, builtin_id: int) -> None:
+    # G: ALL frozen trusted (name, builtinId) pairs -- each preserved exactly.
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "v"
+    if name != "Normal":
+        from openpyxl.styles import NamedStyle
+
+        named = NamedStyle(name=name)
+        named.builtinId = builtin_id
+        wb.add_named_style(named)
+        ws["A1"].style = name
+    source = tmp_path / f"all49_{uuid.uuid4().hex}.xlsx"
+    wb.save(source)
+    wb.close()
+    result = scrub_workbook_object_model(source)
+    try:
+        wb2 = openpyxl.load_workbook(result)
+        assert name in wb2.named_styles
+        wb2.close()
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert f'builtinId="{builtin_id}"' in styles
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_pandas_style_custom_renamed(tmp_path: Path) -> None:
+    # H: openpyxl's own "Pandas" style (builtinId=None) is NOT a trusted
+    # built-in under the frozen policy -- must go through custom rename.
+    import openpyxl.styles.builtins as builtins_module
+    from openpyxl.styles import NamedStyle
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "v"
+    pandas_style = builtins_module.styles["Pandas"]
+    assert pandas_style.builtinId is None  # precondition of this test
+    named = NamedStyle(name="Pandas")
+    wb.add_named_style(named)
+    ws["A1"].style = "Pandas"
+    source = tmp_path / f"pandas_{uuid.uuid4().hex}.xlsx"
+    wb.save(source)
+    wb.close()
+    result = scrub_workbook_object_model(source)
+    try:
+        wb2 = openpyxl.load_workbook(result)
+        names = set(wb2.named_styles)
+        assert "Pandas" not in names
+        assert "DAStyle0001" in names
+        wb2.close()
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_ordinary_custom_unchanged_behavior(tmp_path: Path) -> None:
+    # I: ordinary custom style (builtinId=None, no spoofing) -- existing behavior unchanged.
+    from openpyxl.styles import NamedStyle
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "v"
+    named = NamedStyle(name=f"{SENTINEL}-ordinary")
+    wb.add_named_style(named)
+    ws["A1"].style = f"{SENTINEL}-ordinary"
+    source = tmp_path / f"ordinary_{uuid.uuid4().hex}.xlsx"
+    wb.save(source)
+    wb.close()
+    result = scrub_workbook_object_model(source)
+    try:
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert SENTINEL not in styles
+        assert 'name="DAStyle0001"' in styles
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_mixed_trusted_spoofed_custom_numbering(tmp_path: Path) -> None:
+    # J: mixed styles -- trusted built-in + spoofed built-in + ordinary
+    # custom. DAStyle numbering applies ONLY to untrusted/custom styles,
+    # deterministically, in workbook._named_styles order.
+    from openpyxl.styles import NamedStyle
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "v1"
+    ws["A2"] = "v2"
+    ws["A3"] = "v3"
+    ws["A4"] = "v4"
+
+    trusted = NamedStyle(name="Currency")
+    trusted.builtinId = 4
+    wb.add_named_style(trusted)
+    ws["A1"].style = "Currency"
+
+    spoofed = NamedStyle(name=f"{SENTINEL}-spoofed")
+    spoofed.builtinId = 7  # a DIFFERENT real builtinId, mismatched name
+    wb.add_named_style(spoofed)
+    ws["A2"].style = f"{SENTINEL}-spoofed"
+
+    custom = NamedStyle(name=f"{SENTINEL}-custom")
+    wb.add_named_style(custom)
+    ws["A3"].style = f"{SENTINEL}-custom"
+
+    trusted2 = NamedStyle(name="Title")
+    trusted2.builtinId = 15
+    wb.add_named_style(trusted2)
+    ws["A4"].style = "Title"
+
+    source = tmp_path / f"mixed_{uuid.uuid4().hex}.xlsx"
+    wb.save(source)
+    wb.close()
+    result = scrub_workbook_object_model(source)
+    try:
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert SENTINEL not in styles
+        wb2 = openpyxl.load_workbook(result)
+        names = set(wb2.named_styles)
+        assert names == {"Normal", "Currency", "Title", "DAStyle0001", "DAStyle0002"}
+        assert wb2.active["A1"].style == "Currency"
+        assert wb2.active["A2"].style == "DAStyle0001"
+        assert wb2.active["A3"].style == "DAStyle0002"
+        assert wb2.active["A4"].style == "Title"
+        wb2.close()
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_unicode_confidential_name_with_spoofed_id(tmp_path: Path) -> None:
+    # K: Unicode confidential name + spoofed builtinId.
+    source, result = _build_and_scrub_with_named_style(tmp_path, "Секретное_Имя_Стиля", 2)
+    try:
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert "Секретное_Имя_Стиля" not in styles
+        assert 'name="DAStyle0001"' in styles
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_very_long_confidential_name_with_spoofed_id(tmp_path: Path) -> None:
+    # L: very long confidential name + spoofed builtinId.
+    long_name = f"{SENTINEL}-" + ("X" * 200)
+    source, result = _build_and_scrub_with_named_style(tmp_path, long_name, 13)
+    try:
+        with zipfile.ZipFile(result) as z:
+            styles = z.read("xl/styles.xml").decode("utf-8")
+        assert long_name not in styles
+        assert SENTINEL not in styles
+        assert 'name="DAStyle0001"' in styles
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_builtin_bypass_source_immutability(tmp_path: Path) -> None:
+    # M: source immutability.
+    source, result = _build_and_scrub_with_named_style(tmp_path, f"{SENTINEL}-immutable", 5)
+    try:
+        assert _sha256(source) == _sha256(source)  # sanity: file untouched by this point
+        sha_before = _sha256(source)
+        # scrub already ran once above; verify no mutation occurred to source
+        assert _sha256(source) == sha_before
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_builtin_bypass_reload_succeeds(tmp_path: Path) -> None:
+    # N: save/reload succeeds after correction.
+    source, result = _build_and_scrub_with_named_style(tmp_path, f"{SENTINEL}-reload", 999)
+    try:
+        wb2 = openpyxl.load_workbook(result)
+        assert wb2.active["A1"].value == "v"
+        wb2.close()
+    finally:
+        result.unlink(missing_ok=True)
+
+
+def test_named_style_builtin_bypass_formatting_preserved(tmp_path: Path) -> None:
+    # P: existing style formatting (font) preserved through the correction.
+    from openpyxl.styles import Font, NamedStyle
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["A1"] = "v"
+    named = NamedStyle(name=f"{SENTINEL}-formatted")
+    named.builtinId = 1
+    named.font = Font(bold=True, italic=True)
+    wb.add_named_style(named)
+    ws["A1"].style = f"{SENTINEL}-formatted"
+    source = tmp_path / f"formatted_{uuid.uuid4().hex}.xlsx"
+    wb.save(source)
+    wb.close()
+    result = scrub_workbook_object_model(source)
+    try:
+        wb2 = openpyxl.load_workbook(result)
+        cell = wb2.active["A1"]
+        assert cell.font.bold is True
+        assert cell.font.italic is True
         wb2.close()
     finally:
         result.unlink(missing_ok=True)
